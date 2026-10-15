@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "name": "cq-viewer",
+  "displayName": "CadQuery Viewer",
+  "version": "1.0.0",
+  "description": "本地 3D 模型查看器：浏览项目文件夹里的 STL / STEP（保留装配零件名称、颜色和真实边线），接收 CadQuery 脚本推送的模型，在模型上标注位置并一键发给 AI。",
+  "author": "HanZijie",
+  "icon": "icon.png",
+  "category": "Code",
+  "exampleQueries": [
+    "打开 CadQuery Viewer 看一下这个项目里的模型",
+    "用 CadQuery Viewer 打开这个 STEP 装配",
+    "我在 Viewer 里标注了几个位置，读一下再改模型"
+  ],
+  "apps": [],
+  "mcpServers": [],
+  "skills": []
+}
