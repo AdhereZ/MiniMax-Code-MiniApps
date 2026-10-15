@@ -9,7 +9,7 @@
 
 MiniMax Code 里的本地 3D 模型查看器。打开项目文件夹里的 STL 和 STEP（STEP 装配保留零件名称、颜色和真实 CAD 边线），实时显示 CadQuery 脚本推送的模型，在模型上标出位置后一键发到对话里，让 AI 准确知道你说的是哪个面、哪个孔、哪条边。AI 可以通过 MCP 工具登记模型文件夹、在查看器里打开模型；包里还内置了 flowful-ai 的 CadQuery 参数化建模 skill。
 
-作者：[HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai)（内置的 CadQuery skill） · 版本：`1.1.0`
+作者：[HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai)（内置的 CadQuery skill） · 版本：`1.1.1`
 
 ![CadQuery Viewer：一个 STEP 装配，已标注三个位置，准备发送](docs/preview.jpg)
 
@@ -106,24 +106,26 @@ clear()                                      # 清空推送的模型
 - `~/.cqview/scene/`：`python/cqview.py` 或 `copy_to_scene` 推送的模型（`.stl`、`.step`、`.stp`、`scene.json`）。
 - `~/.cqview/roots.json` 和 `~/.cqview/selection.json`（它自己的文件，见下文）。
 
-**写入**：在 `dataDir` 之外只写自己的交换目录 `~/.cqview/`，都是原子写入（同目录临时文件再改名），并且逐个执行：
+**写入**：在 `dataDir` 之外只写自己的交换目录 `~/.cqview/`，都是原子写入（同目录下名字唯一的临时文件，再改名），逐个执行，并保留原文件的权限：
 
 - `~/.cqview/roots.json`：登记过的文件夹（添加文件夹、页面带 `?root=` 打开，或 AI 调用 `add_model_folder` / `add_model_file` 时）。
 - `~/.cqview/selection.json`：当前标注，包括点、备注、说明和每个标注所在模型的绝对路径。每次修改都会重写，以最后一次写入为准。
 - `~/.cqview/scene/<name>.<扩展名>` 和 `~/.cqview/scene/scene.json`：只在 `add_model_file` 带 `copy_to_scene` 时写，包括复制的模型、它的颜色/不透明度，并删除同名的其他格式模型（和 `cqview.py` 一样）。
 - 如果 `~/.cqview/` 和 `~/.cqview/scene/` 不存在会创建。它从不写入你的项目文件夹。
 
-在 `dataDir` 内保存 `step-cache/`，即 STEP 转换结果，按文件路径、大小和修改时间区分，可以随时删除；以及 `open-requests.json`，最近 24 小时内最多 20 条 AI 请求（文件夹 ID、相对该文件夹的路径，或场景模型名）。
+在 `dataDir` 内保存 `step-cache/`，即 STEP 转换结果，按文件路径、大小和修改时间区分，可以随时删除（每次启动后第一次转换时，清理 30 天没用过的条目、超出 1 GB 的部分（最久没用的先删），以及超过一天的临时文件）；以及 `open-requests.json`，最近 24 小时内最多 20 条 AI 请求（文件夹 ID、相对该文件夹的路径，或场景模型名）。
 
 **子进程**：只有打开 STEP 时才启动 Python。参数以数组传递（不经过 shell），忽略标准输入输出，Viewer 关闭时结束所有子进程：
 
 - 探测，直到找到可用的候选：`<python> -c "import cadquery"`（超时 60 秒）。
 - 转换：`<python> <插件目录>/miniapp/node/step_mesh.py <模型.step> <dataDir>/step-cache/<hash>.cqvm.<pid>.tmp`（超时 300 秒）。
-- 转换失败时退回：`<python> -c <内置 STEP→STL 脚本> <模型.step> <dataDir>/step-cache/<hash>.stl.<pid>.tmp`。
+- 转换失败时退回：`<python> -c <内置 STEP→STL 脚本> <模型.step> <dataDir>/step-cache/<hash>.stl.<pid>.tmp`。如果转换是被主动停止的（超时、Mini App 关闭）或被直接结束（`SIGKILL`/`SIGTERM`），不再退回；`SIGSEGV` 这类原生崩溃仍会退回。Mini App 开始关闭后不再启动任何 Python 进程。
 
 模型路径会先校验（在登记的文件夹内、扩展名允许、不是符号链接），再作为单个参数传入。
 
-**MCP 端点**：Mini App 回环端口上的 `POST /mcp/cq-viewer`。`Host` 或 `Origin` 不是本机的请求一律拒绝，只接受 JSON 请求体。工具遵守和页面相同的文件夹规则。
+**请求校验**：所有路由（包括页面本身）都拒绝 `Host` 不是本机（`127.0.0.1`、`localhost`、`::1`）的请求，也拒绝带了 `Origin` 但不是这个端口本身的请求，所以通过 DNS rebinding 或其他来源的网页无法登记文件夹、读取模型。写请求只接受 JSON 请求体。
+
+**MCP 端点**：Mini App 回环端口上的 `POST /mcp/cq-viewer`，同样经过上述校验。工具遵守和页面相同的文件夹规则。
 
 **内置 skill**：Mini App 本身从不运行它。Agent 按 skill 操作时，会通过自己的终端工具（照常经过权限确认）运行其中的 Python 脚本：`run_cadquery_model.py` 在子 Python 进程里执行模型脚本并收集它写出的文件，`preview.py` 离屏渲染 PNG。脚本不发起网络请求；skill 会让 Agent 用网页搜索查真实尺寸，缺少依赖时它的安装说明会用 `pip`（或 `conda`）安装上面列出的 Python 包。
 
@@ -138,8 +140,8 @@ clear()                                      # 清空推送的模型
 ## 测试环境
 
 - MiniMax Code 桌面版 `3.1.1-preview.4597`（Electron 42），macOS 26（Apple Silicon）；Python 3.9 + CadQuery 2.5.2 / OCP 7.7.2、trimesh 4.12、pyrender 0.1.45。
-- 在 MiniMax Code 中验证（1.1.0）：本机安装；新开的对话里能看到 `mcp__cq-viewer__add_model_folder`、`mcp__cq-viewer__add_model_file`、`mcp__cq-viewer__list_model_folders` 和 skill `cq-viewer:parametric-3d-printing`；经宿主调用了 `list_model_folders` 和 `add_model_folder`（`select: false`）。1.0.0 时验证过：打开、通过 `?root=` 登记文件夹、宿主桥接探测（这个版本不响应 `ui/initialize` 握手，因此走降级路径）。
-- `tests/mcp.test.mjs`（`node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs`）：三个工具、文件夹规则、带颜色复制到场景、重启后的请求记录、回环与 JSON 检查，共 10 个测试，用临时用户目录跑真实的 Node 入口。
+- 在 MiniMax Code 中验证（1.1.1）：本机安装；带 `?root=` 打开的页面在新的 Host/Origin 校验下能正常读取和登记文件夹，面板开着时 `list_model_folders` 返回 `viewer_connected: true`。（1.1.0）：本机安装；新开的对话里能看到 `mcp__cq-viewer__add_model_folder`、`mcp__cq-viewer__add_model_file`、`mcp__cq-viewer__list_model_folders` 和 skill `cq-viewer:parametric-3d-printing`；经宿主调用了 `list_model_folders` 和 `add_model_folder`（`select: false`）。1.0.0 时验证过：打开、通过 `?root=` 登记文件夹、宿主桥接探测（这个版本不响应 `ui/initialize` 握手，因此走降级路径）。
+- `node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs`：共 19 个测试，用临时用户目录跑真实的 Node 入口。`tests/mcp.test.mjs`：三个工具、文件夹规则、带颜色复制到场景、重启后的请求记录、回环与 JSON 检查。`tests/server.test.mjs`：40 个并发保存标注、8 个并发登记文件夹（页面和 MCP 混合）没有报错也没有丢条目；用假 Python 验证转换中 dispose 会结束进程且不启动退回转换、被结束的转换不退回、`SIGSEGV` 崩溃仍会退回；缓存清理；所有路由的 Host/Origin 校验；版本号一致。
 - 在无头 Chrome 中对同一个 Node 入口做了端到端测试：AI 调用工具后页面切换文件夹并打开文件；`copy_to_scene` 复制的零件按指定颜色显示；页面关着时请求的文件在下次打开时出现，之后不会重复执行，用户取消勾选后保持关闭；页面离开后 `viewer_connected` 变为 false。1.0.0 时测过：打开 STL 和 STEP（多层装配，含名称、颜色、复用实例）、自动重新加载、选点 → 确认 → 备注、模拟 MCP Apps 宿主下的 `ui/message` 路径、模拟页面桥接下的降级路径，以及没有宿主时按钮切换为复制。
 - 内置 skill：在已安装的插件目录里运行 `run_cadquery_model.py --preview --strict`（建模 → STL → watertight 校验 → 预览图）。
 - 未验证：Windows；查看器面板开着时经宿主调用 `add_model_file`（页面这一侧只在无头 Chrome 里验证过）；这个版本里发送的降级路径是否真的填进了对话输入框；其他 CAD 软件导出的带面级颜色的 STEP；skill 的 Gridfinity 生成器在 CadQuery 2.5 下的表现（skill 要求 2.6.1 及以上）。
