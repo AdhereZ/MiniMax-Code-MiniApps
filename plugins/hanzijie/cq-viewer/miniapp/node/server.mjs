@@ -10,14 +10,16 @@
 //
 // Folder browsing is scoped: only folders registered in roots.json, only inside the
 // user's home directory, only .stl/.step/.stp files, no symlinks, no hidden folders.
-// The MCP endpoint (mcp.mjs) only answers loopback requests and reuses the same rules;
-// its one extra power is copy_to_scene, which copies a model file into ~/.cqview/scene.
+// Every route answers only loopback requests (Host is this machine; Origin, if sent, is this listener).
+// The MCP endpoint (mcp.mjs) reuses the folder rules; its one extra power is copy_to_scene, which
+// copies a model file into ~/.cqview/scene. Writes to ~/.cqview run one at a time (serial()).
 
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream, watch } from 'node:fs';
 import {
   access,
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -27,6 +29,7 @@ import {
   rename,
   stat,
   unlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -67,6 +70,9 @@ const PY_PROBE_TIMEOUT_MS = 60_000;
 const STEP_TIMEOUT_MS = 300_000;
 const STEP_MESH_VERSION = 'cqvm-1';
 const CQVM_TYPE = 'application/x-cqview-mesh';
+const STEP_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const STEP_CACHE_MAX_BYTES = 1024 * 1024 * 1024;
+const STEP_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_REQUESTS = 20;
 const REQUEST_TYPES = new Set(['folder', 'file', 'scene']);
@@ -118,6 +124,8 @@ export async function start(context) {
   const stepCacheDir = join(context.dataDir, 'step-cache');
   const requestsFile = join(context.dataDir, 'open-requests.json');
   const log = context.logger;
+  /** Set by dispose(): from then on nothing new is spawned. */
+  let disposed = false;
 
   /** Read-modify-write of our JSON files runs one at a time (page and AI can write together). */
   let writeChain = Promise.resolve();
@@ -174,8 +182,9 @@ export async function start(context) {
   };
 
   const ensureSceneWatcher = async () => {
-    if (sceneWatcher) return;
+    if (sceneWatcher || disposed) return;
     await mkdir(SCENE_DIR, { recursive: true });
+    if (sceneWatcher || disposed) return; // a request raced us, or dispose ran meanwhile
     sceneWatcher = watch(SCENE_DIR, { persistent: false }, () =>
       debounced('scene', () => {
         sceneVersion += 1;
@@ -191,6 +200,7 @@ export async function start(context) {
 
   const syncRootWatchers = async () => {
     const roots = await readRoots();
+    if (disposed) return;
     const wanted = new Set();
     for (const r of roots) {
       const id = rootId(r.path);
@@ -416,7 +426,7 @@ export async function start(context) {
     const dst = join(SCENE_DIR, `${name}${src.ext}`);
     await serial(async () => {
       await mkdir(SCENE_DIR, { recursive: true });
-      const tmp = join(SCENE_DIR, `.${name}.${process.pid}.${Date.now()}.tmp`);
+      const tmp = join(SCENE_DIR, `.${name}.${process.pid}.${randomUUID()}.tmp`);
       try {
         await copyFile(src.real, tmp);
         await rename(tmp, dst);
@@ -511,12 +521,15 @@ export async function start(context) {
 
   /** @param {string} file @param {import('node:fs').Stats} st @returns {Promise<{path: string, type: 'cqvm'|'stl'}>} */
   const stepToMesh = async (file, st) => {
+    if (disposed) throw new HttpError(503, 'shutting_down', '查看器正在关闭');
     const key = createHash('sha1').update(`${STEP_MESH_VERSION}|${file}|${st.size}|${st.mtimeMs}`).digest('hex');
     const outMesh = join(stepCacheDir, `${key}.cqvm`);
     const outStl = join(stepCacheDir, `${key}.stl`);
     for (const [path, type] of /** @type {const} */ ([[outMesh, 'cqvm'], [outStl, 'stl']])) {
       try {
         await access(path);
+        const now = new Date();
+        await utimes(path, now, now).catch(() => {}); // last use, for pruning
         return { path, type };
       } catch {
         /* not cached yet */
@@ -526,8 +539,12 @@ export async function start(context) {
     if (running) return running;
     const job = (async () => {
       const python = await findPython();
-      if (!python) throw new HttpError(503, 'step_unavailable', '打开 STEP 需要本机的 Python 和 CadQuery');
+      if (!python) {
+        if (disposed) throw new HttpError(503, 'shutting_down', '查看器正在关闭');
+        throw new HttpError(503, 'step_unavailable', '打开 STEP 需要本机的 Python 和 CadQuery');
+      }
       await mkdir(stepCacheDir, { recursive: true });
+      pruneOnce();
       // 1) full fidelity: assembly names, colours, real edges
       const tmpMesh = `${outMesh}.${process.pid}.tmp`;
       try {
@@ -540,7 +557,17 @@ export async function start(context) {
         if (code === 'exit_3' || code === 'exit_4') {
           throw new HttpError(422, 'step_convert_failed', code === 'exit_3' ? '这个 STEP 文件读不出来，可能已损坏' : '这个 STEP 文件里没有实体');
         }
-        log.warn('cqviewer.step.mesh_failed', { code: code ?? 'unknown' });
+        // Stopped on purpose (shutdown, time limit) or killed outright: running the fallback would
+        // only start another Python nobody waits for. A native crash (SIGSEGV, SIGABRT …) is what
+        // the simpler fallback is for, so that one still falls through.
+        if (code === 'disposed') throw new HttpError(503, 'shutting_down', '查看器正在关闭');
+        if (code === 'timeout') {
+          throw new HttpError(422, 'step_convert_failed', 'STEP 转换超过 5 分钟，已停止；文件可能太大或太复杂');
+        }
+        if (code === 'signal_SIGKILL' || code === 'signal_SIGTERM') {
+          throw new HttpError(422, 'step_convert_failed', 'STEP 转换进程被系统结束了，可能是内存不足');
+        }
+        log.warn(`cqviewer.step.mesh_failed ${code ?? 'unknown'}`, { code: code ?? 'unknown' });
       }
       // 2) fallback: single merged mesh
       const tmpStl = `${outStl}.${process.pid}.tmp`;
@@ -550,12 +577,24 @@ export async function start(context) {
         return { path: outStl, type: /** @type {const} */ ('stl') };
       } catch (error) {
         await unlink(tmpStl).catch(() => {});
-        log.warn('cqviewer.step.convert_failed', { code: /** @type {any} */ (error).code ?? 'unknown' });
+        const code = /** @type {any} */ (error).code;
+        if (code === 'disposed') throw new HttpError(503, 'shutting_down', '查看器正在关闭');
+        log.warn(`cqviewer.step.convert_failed ${code ?? 'unknown'}`, { code: code ?? 'unknown' });
         throw new HttpError(422, 'step_convert_failed', 'STEP 没有打开成功，文件可能已损坏或不含实体');
       }
     })().finally(() => stepJobs.delete(key));
     stepJobs.set(key, job);
     return job;
+  };
+
+  /** Drop cache entries unused for STEP_CACHE_MAX_AGE_MS, then the oldest until under STEP_CACHE_MAX_BYTES. */
+  let pruned = false;
+  const pruneOnce = () => {
+    if (pruned) return;
+    pruned = true;
+    void pruneStepCache(stepCacheDir).catch((error) =>
+      log.warn(`cqviewer.step.prune_failed ${error?.code ?? 'unknown'}`, { code: error?.code ?? 'unknown' }),
+    );
   };
 
   /** Stream a model file, converting STEP on the way. */
@@ -579,6 +618,7 @@ export async function start(context) {
           '/usr/local/bin/python3',
         ].filter((c) => typeof c === 'string' && c.length > 0);
         for (const c of /** @type {string[]} */ (candidates)) {
+          if (disposed) return null;
           try {
             await runChild(c, ['-c', 'import cadquery'], PY_PROBE_TIMEOUT_MS);
             return c;
@@ -595,13 +635,25 @@ export async function start(context) {
     return pythonProbe;
   };
 
-  /** @param {string} cmd @param {string[]} args @param {number} timeoutMs */
+  /**
+   * Rejects with code 'disposed' once dispose() has run (and when dispose kills the child),
+   * 'timeout' when the time limit kills it, 'signal_<SIG>' / 'exit_<n>' otherwise.
+   * @param {string} cmd @param {string[]} args @param {number} timeoutMs
+   */
   const runChild = (cmd, args, timeoutMs) =>
     new Promise((resolve, reject) => {
+      if (disposed) {
+        reject(Object.assign(new Error('disposed'), { code: 'disposed' }));
+        return;
+      }
       // stdout is reserved for the Host protocol: never inherit it.
       const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'ignore'], env: process.env });
       children.add(child);
-      const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, timeoutMs);
       child.on('error', (error) => {
         clearTimeout(timer);
         children.delete(child);
@@ -611,7 +663,10 @@ export async function start(context) {
         clearTimeout(timer);
         children.delete(child);
         if (code === 0) resolve(undefined);
-        else reject(Object.assign(new Error('child failed'), { code: signal ? `signal_${signal}` : `exit_${code}` }));
+        else {
+          const why = disposed ? 'disposed' : timedOut ? 'timeout' : signal ? `signal_${signal}` : `exit_${code}`;
+          reject(Object.assign(new Error('child failed'), { code: why }));
+        }
       });
     });
 
@@ -654,7 +709,7 @@ export async function start(context) {
       const { d, dx, dy, dz } = /** @type {any[]} */ (doc.segments)[0];
       doc.distance = { d, dx, dy, dz };
     }
-    await writeJsonAtomic(SELECTION_FILE, doc); // commit first …
+    await serial(() => writeJsonAtomic(SELECTION_FILE, doc)); // commit first …
     const client = /** @type {any} */ (body).client;
     broadcast({ type: 'selection', client: typeof client === 'string' && CLIENT_ID_RE.test(client) ? client : null }); // … then notify
     return doc;
@@ -707,10 +762,13 @@ export async function start(context) {
     const path = url.pathname;
     const method = request.method ?? 'GET';
 
-    // MCP: the Host's MCP client calls this over loopback. Refuse anything a browser page on another
-    // origin (or a DNS-rebound hostname) could send.
+    // Every route: the Host header must name this machine (a DNS-rebound hostname is refused) and a
+    // browser Origin, when sent, must be this listener itself. The page is same-origin; the Host's
+    // MCP client is a Node process and sends no Origin.
+    if (!isLoopbackRequest(request, context.listen.port)) return sendJson(response, 403, { error: 'forbidden' });
+
+    // MCP: the Host's MCP client calls this over loopback.
     if (path === MCP_PATH) {
-      if (!isLoopbackRequest(request)) return sendJson(response, 403, { error: 'forbidden' });
       if (method !== 'POST') {
         response.writeHead(405, { allow: 'POST', 'content-type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ error: 'method_not_allowed' }));
@@ -821,10 +879,9 @@ export async function start(context) {
   await listen(server, context.listen.host, context.listen.port);
   log.info('cqviewer.runtime.listening');
 
-  let disposed = false;
   const dispose = async () => {
     if (disposed) return;
-    disposed = true;
+    disposed = true; // runChild refuses from here on, so no fallback can start after this
     context.signal.removeEventListener('abort', onAbort);
     clearInterval(heartbeat);
     for (const t of timers.values()) clearTimeout(t);
@@ -839,6 +896,7 @@ export async function start(context) {
     clients.clear();
     server.closeAllConnections?.();
     await close(server);
+    await writeChain; // let a write already in progress finish its rename
   };
   const onAbort = () => {
     void dispose();
@@ -1029,17 +1087,24 @@ function sceneNameFrom(/** @type {string} */ file) {
 }
 
 /**
- * Host must be loopback (blocks DNS rebinding); Origin, when a browser sends one, too.
- * The Host's MCP client is a Node process and sends no Origin.
+ * Host must be loopback (blocks DNS rebinding). Origin, when a browser sends one, must be this
+ * listener: loopback host and our port. The Host's MCP client is a Node process and sends no Origin.
  * @param {import('node:http').IncomingMessage} request
+ * @param {number} port
  */
-function isLoopbackRequest(request) {
+function isLoopbackRequest(request, port) {
   const host = request.headers.host;
   if (host !== undefined && !LOOPBACK_HOSTS.has(hostnameOf(host))) return false;
   const origin = request.headers.origin;
   if (origin === undefined) return true;
-  const m = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]]*\]|[^/:?#]+)/i.exec(origin);
-  return !!m && LOOPBACK_HOSTS.has(hostnameOf(m[1]));
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false; // includes "null" (sandboxed iframes, file://)
+  }
+  const originPort = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+  return url.protocol === 'http:' && LOOPBACK_HOSTS.has(hostnameOf(url.host)) && originPort === port;
 }
 
 /** @param {string} hostHeader */
@@ -1130,12 +1195,53 @@ function clamp(v, lo, hi) {
   return Math.min(hi, Math.max(lo, v));
 }
 
-/** @param {string} file @param {unknown} data */
+/**
+ * Temp file in the same folder, then rename. The random suffix keeps two writes in the same
+ * millisecond apart; callers that read-modify-write go through serial(). The file keeps its mode.
+ * @param {string} file @param {unknown} data
+ */
 async function writeJsonAtomic(file, data) {
   await mkdir(dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  await rename(tmp, file);
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    const prev = await stat(file).catch(() => null);
+    if (prev) await chmod(tmp, prev.mode & 0o777);
+    await rename(tmp, file);
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+/**
+ * Remove step-cache entries not used for STEP_CACHE_MAX_AGE_MS (a cache hit refreshes the
+ * modification time), then the least recently used until the folder is under STEP_CACHE_MAX_BYTES.
+ * Also clears temp files left by a crash. Only touches the files this Mini App writes there.
+ * @param {string} dir
+ */
+async function pruneStepCache(dir) {
+  const now = Date.now();
+  /** @type {{path: string, size: number, mtime: number}[]} */
+  const kept = [];
+  for (const name of await readdir(dir)) {
+    if (!/^[a-f0-9]{40}\.(cqvm|stl)(\.\d+\.tmp)?$/.test(name)) continue;
+    const path = join(dir, name);
+    const st = await lstat(path).catch(() => null);
+    if (!st || !st.isFile()) continue;
+    const age = now - st.mtimeMs;
+    if (name.endsWith('.tmp') ? age > STEP_TMP_MAX_AGE_MS : age > STEP_CACHE_MAX_AGE_MS) {
+      await unlink(path).catch(() => {});
+    } else if (!name.endsWith('.tmp')) {
+      kept.push({ path, size: st.size, mtime: st.mtimeMs });
+    }
+  }
+  let total = kept.reduce((sum, f) => sum + f.size, 0);
+  kept.sort((a, b) => a.mtime - b.mtime);
+  for (const f of kept) {
+    if (total <= STEP_CACHE_MAX_BYTES) break;
+    await unlink(f.path).catch(() => {});
+    total -= f.size;
+  }
 }
 
 /**

@@ -9,7 +9,7 @@
 
 A local 3D viewer for MiniMax Code. Open STL and STEP models from your project folder — STEP assemblies keep their part names, colours, and real CAD edges — watch models pushed live from CadQuery scripts, then mark positions on the model and send them to the conversation in one click, so the AI knows exactly which face, hole, or edge you mean. The AI can register model folders and open models in the viewer through MCP tools, and the package bundles flowful-ai's CadQuery parametric-design skill.
 
-Authors: [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai) (bundled CadQuery skill) · Version: `1.1.0`
+Authors: [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai) (bundled CadQuery skill) · Version: `1.1.1`
 
 ![CadQuery Viewer: a STEP assembly with three annotations ready to send](docs/preview.jpg)
 
@@ -106,24 +106,26 @@ The page first performs the standard MCP Apps handshake (`ui/initialize` over `p
 - `~/.cqview/scene/` — models pushed by `python/cqview.py` or `copy_to_scene` (`.stl`, `.step`, `.stp`, `scene.json`).
 - `~/.cqview/roots.json` and `~/.cqview/selection.json` (its own files, see below).
 
-**What it writes.** Outside `dataDir` it writes only its own exchange folder `~/.cqview/`, always atomically (temp file in the same folder, then rename), one write at a time:
+**What it writes.** Outside `dataDir` it writes only its own exchange folder `~/.cqview/`, always atomically (uniquely named temp file in the same folder, then rename), one write at a time, keeping the existing file's permissions:
 
 - `~/.cqview/roots.json` — the registered folders (when you add one, the page is opened with `?root=`, or the AI calls `add_model_folder` / `add_model_file`).
 - `~/.cqview/selection.json` — the current annotations: points, notes, instruction, and the absolute path of each annotated model. Rewritten on every change; the last write wins.
 - `~/.cqview/scene/<name>.<ext>` and `~/.cqview/scene/scene.json` — only for `add_model_file` with `copy_to_scene`: the copied model, its colour/opacity, and removal of the same name in the other model formats (as `cqview.py` does).
 - It creates `~/.cqview/` and `~/.cqview/scene/` if missing. It never writes into your project folders.
 
-Inside `dataDir` it keeps `step-cache/`, the converted STEP meshes keyed by file path, size, and modification time (deleting it is safe), and `open-requests.json`, the last 20 AI requests from the past 24 hours (folder ID, path relative to that folder, or scene name).
+Inside `dataDir` it keeps `step-cache/`, the converted STEP meshes keyed by file path, size, and modification time (deleting it is safe; on the first conversion after each start, entries unused for 30 days, entries beyond 1 GB (least recently used first), and temp files older than a day are removed), and `open-requests.json`, the last 20 AI requests from the past 24 hours (folder ID, path relative to that folder, or scene name).
 
 **Processes.** Python is started only when a STEP file is opened, with arguments passed as an array (no shell), stdio ignored, and every child killed on shutdown:
 
 - Probe, until one candidate works: `<python> -c "import cadquery"` (60 s timeout).
 - Convert: `<python> <plugin>/miniapp/node/step_mesh.py <model.step> <dataDir>/step-cache/<hash>.cqvm.<pid>.tmp` (300 s timeout).
-- Fallback if that fails: `<python> -c <inline STEP→STL script> <model.step> <dataDir>/step-cache/<hash>.stl.<pid>.tmp`.
+- Fallback if that fails: `<python> -c <inline STEP→STL script> <model.step> <dataDir>/step-cache/<hash>.stl.<pid>.tmp`. Not used when the conversion was stopped on purpose (time limit, shutdown) or killed outright (`SIGKILL`/`SIGTERM`); a native crash such as `SIGSEGV` still falls back. Once the Mini App is shutting down, no Python process is started.
 
 The model path is validated first (registered folder, allowed extension, no symbolic link) and passed as a single argument.
 
-**MCP endpoint.** `POST /mcp/cq-viewer` on the Mini App's loopback listener. It rejects requests whose `Host` or `Origin` is not loopback, and accepts JSON bodies only. The tools apply the same folder rules as the page.
+**Request checks.** Every route, the page included, refuses a request whose `Host` is not this machine (`127.0.0.1`, `localhost`, `::1`) or whose `Origin`, when present, is not this listener itself, so a web page reached through DNS rebinding or another origin cannot register folders or read models. Writes accept JSON bodies only.
+
+**MCP endpoint.** `POST /mcp/cq-viewer` on the Mini App's loopback listener, under the same checks. The tools apply the same folder rules as the page.
 
 **Bundled skill.** The Mini App never runs it. When the agent follows the skill it runs the skill's Python scripts itself, through its normal shell tool and permission prompts: `run_cadquery_model.py` executes the model script in a child Python process and collects the files it wrote; `preview.py` renders PNGs offscreen. The scripts make no network requests; the skill asks the agent to look up real-world dimensions with web search, and its setup section installs the Python packages above with `pip` (or `conda`) if they are missing.
 
@@ -138,8 +140,8 @@ The model path is validated first (registered folder, allowed extension, no symb
 ## Tested environment
 
 - MiniMax Code desktop `3.1.1-preview.4597` (Electron 42), macOS 26 (Apple Silicon); Python 3.9 with CadQuery 2.5.2 / OCP 7.7.2, trimesh 4.12, pyrender 0.1.45.
-- In MiniMax Code (1.1.0): local install; a new conversation lists `mcp__cq-viewer__add_model_folder`, `mcp__cq-viewer__add_model_file`, `mcp__cq-viewer__list_model_folders` and the skill `cq-viewer:parametric-3d-printing`; `list_model_folders` and `add_model_folder` (`select: false`) called through the Host. Earlier (1.0.0): open, folder registration via `?root=`, and Host bridge detection (the `ui/initialize` handshake is not answered in this build, so the fallback path is used).
-- `tests/mcp.test.mjs` (`node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs`): the three tools, folder rules, copy to scene with colour, request log across a restart, loopback/JSON checks — 10 tests against the real Node entry with a temporary home directory.
+- In MiniMax Code (1.1.1): local install; the page opened with `?root=` reads and registers folders under the new Host/Origin checks, and `list_model_folders` reports `viewer_connected: true` while the panel is open. (1.1.0): local install; a new conversation lists `mcp__cq-viewer__add_model_folder`, `mcp__cq-viewer__add_model_file`, `mcp__cq-viewer__list_model_folders` and the skill `cq-viewer:parametric-3d-printing`; `list_model_folders` and `add_model_folder` (`select: false`) called through the Host. Earlier (1.0.0): open, folder registration via `?root=`, and Host bridge detection (the `ui/initialize` handshake is not answered in this build, so the fallback path is used).
+- `node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs` — 19 tests against the real Node entry with a temporary home directory. `tests/mcp.test.mjs`: the three tools, folder rules, copy to scene with colour, request log across a restart, loopback/JSON checks. `tests/server.test.mjs`: 40 concurrent annotation saves and 8 concurrent folder registrations (page and MCP mixed) without errors or lost entries; with a fake Python, dispose during a STEP conversion kills it and starts no fallback, a killed conversion does not fall back, a `SIGSEGV` crash does; step-cache pruning; Host/Origin checks on every route; versions in sync.
 - End-to-end in headless Chrome against the same Node entry: the page switches folder and opens the file when the AI calls the tools; `copy_to_scene` shows the copied part in its colour; a file requested while the page is closed opens on the next visit, is not replayed after that, and stays closed once you untick it; `viewer_connected` turns false when the page goes away. From 1.0.0: STL and STEP opening (multi-level assemblies with names, colours, instances), live reload, pick → confirm → notes, the `ui/message` path against a simulated MCP Apps host, the fallback path against a simulated page bridge, and copy mode without a Host.
 - Bundled skill: `run_cadquery_model.py --preview --strict` run from the installed plugin directory (model → STL → watertight check → preview PNG).
 - Not verified: Windows; `add_model_file` through the Host with the viewer panel open (the page side was verified in headless Chrome only); that the Send fallback actually fills the conversation input in this build; STEP files with face-level colours from other CAD tools; the skill's Gridfinity generator with CadQuery 2.5 (the skill asks for 2.6.1 or later).

@@ -173,7 +173,8 @@ test('the MCP endpoint refuses non-loopback Host/Origin, GET, and non-JSON bodie
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' });
   assert.equal((await raw('POST', '/mcp/cq-viewer', body, { host: 'evil.example.com' })).status, 403);
   assert.equal((await raw('POST', '/mcp/cq-viewer', body, { origin: 'https://evil.example.com' })).status, 403);
-  assert.equal((await raw('POST', '/mcp/cq-viewer', body, { origin: 'http://127.0.0.1:1234' })).status, 200);
+  assert.equal((await raw('POST', '/mcp/cq-viewer', body, { origin: 'http://127.0.0.1:1' })).status, 403); // other local app
+  assert.equal((await raw('POST', '/mcp/cq-viewer', body, { origin: `http://127.0.0.1:${port}` })).status, 200);
   assert.equal((await raw('GET', '/mcp/cq-viewer', undefined, {})).status, 405);
   assert.equal((await raw('POST', '/mcp/cq-viewer', body, { 'content-type': 'text/plain' })).status, 415);
 });
