@@ -22,3 +22,7 @@ SOFTWARE.
 
 Third-party components keep their own licenses:
 - three.js (MIT) — miniapp/client/assets/vendor/LICENSE-three.txt
+- skills/parametric-3d-printing/ — from https://github.com/flowful-ai/cad-skill,
+  PolyForm Noncommercial License 1.0.0 (noncommercial use only), see
+  skills/parametric-3d-printing/LICENSE. This MIT license does not apply to it.
+  Required Notice: Copyright Nicolas Chourrout (https://github.com/nchourrout)

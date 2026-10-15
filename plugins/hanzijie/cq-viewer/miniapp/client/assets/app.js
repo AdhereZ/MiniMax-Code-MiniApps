@@ -32,9 +32,12 @@ function loadPrefs() {
       root: typeof raw.root === 'string' ? raw.root : null,
       edges: raw.edges !== false,
       grid: raw.grid !== false,
+      // last AI request (MCP) this browser has carried out
+      reqEpoch: typeof raw.reqEpoch === 'string' ? raw.reqEpoch : null,
+      reqSeq: Number.isInteger(raw.reqSeq) ? raw.reqSeq : 0,
     };
   } catch {
-    return { hidden: new Set(), opened: [], root: null, edges: true, grid: true };
+    return { hidden: new Set(), opened: [], root: null, edges: true, grid: true, reqEpoch: null, reqSeq: 0 };
   }
 }
 function savePrefs() {
@@ -47,6 +50,8 @@ function savePrefs() {
         root: prefs.root,
         edges: prefs.edges,
         grid: prefs.grid,
+        reqEpoch: prefs.reqEpoch,
+        reqSeq: prefs.reqSeq,
       }),
     );
   } catch {
@@ -825,7 +830,7 @@ function selectRoot(id) {
   savePrefs();
   renderRootSelect();
   renderFileList();
-  void syncFiles(id);
+  return syncFiles(id);
 }
 
 function renderRootSelect() {
@@ -1849,6 +1854,95 @@ function applyHostContext(ctx) {
   refreshThemeColors();
 }
 
+// ---------------------------------------------------------------- requests from the AI (MCP tools)
+// The Node side keeps the last requests in dataDir, so they still apply when the page opens later.
+let requestChain = Promise.resolve();
+function applyRequests() {
+  requestChain = requestChain.then(applyRequestsNow, applyRequestsNow).catch(() => {});
+  return requestChain;
+}
+async function applyRequestsNow() {
+  const res = await fetch(apiUrl('requests'), { cache: 'no-store' });
+  if (!res.ok) return;
+  const data = await res.json();
+  if (!data || !Array.isArray(data.items) || typeof data.epoch !== 'string') return;
+  // a new epoch means the request log was recreated: everything in it is new to us
+  const after = data.epoch === prefs.reqEpoch ? prefs.reqSeq : 0;
+  const todo = data.items
+    .filter((it) => it && Number.isInteger(it.seq) && it.seq > after)
+    .sort((a, b) => a.seq - b.seq);
+  for (const item of todo) {
+    try {
+      await applyRequest(item);
+    } catch (error) {
+      showToast(`AI 请求的内容没有打开：${error instanceof Error ? error.message : String(error)}`, 'error', 5000);
+    }
+    prefs.reqEpoch = data.epoch;
+    prefs.reqSeq = item.seq;
+    savePrefs();
+  }
+  if (prefs.reqEpoch !== data.epoch) {
+    prefs.reqEpoch = data.epoch;
+    prefs.reqSeq = Number.isInteger(data.seq) ? data.seq : 0;
+    savePrefs();
+  }
+}
+
+async function applyRequest(item) {
+  if (item.type === 'scene' && typeof item.name === 'string') {
+    const key = sceneKey(item.name);
+    if (prefs.hidden.delete(key)) savePrefs();
+    await refreshScene();
+    const entry = await settled(key);
+    if (entry) applyMaterial(entry);
+    revealAll();
+    showToast(`AI 推送了 ${item.name}`, 'info', 3000);
+    return;
+  }
+  if ((item.type !== 'folder' && item.type !== 'file') || !ROOT_ID_RE.test(item.root)) return;
+  if (!roots.some((r) => r.id === item.root)) await loadRoots();
+  const root = roots.find((r) => r.id === item.root);
+  if (!root) throw new Error('文件夹已不在列表里');
+  await selectRoot(item.root);
+  if (item.type === 'folder') {
+    openPanel('files');
+    showToast(`AI 添加了文件夹「${root.label}」`, 'info', 3000);
+    return;
+  }
+  const state = fileLists.get(item.root);
+  if (state?.error) throw new Error(state.error);
+  const file = state?.files.find((f) => f.rel === item.rel);
+  if (!file) throw new Error(`在「${root.label}」里找不到 ${item.rel}`);
+  const key = fileKey(item.root, item.rel);
+  if (prefs.opened.includes(key)) {
+    // already open: make sure it is shown
+    if (prefs.hidden.delete(key)) savePrefs();
+    const entry = parts.get(key);
+    if (entry) applyMaterial(entry);
+    renderParts();
+  } else {
+    await openFile(item.root, file);
+  }
+  revealAll();
+  showToast(`AI 打开了 ${baseName(item.rel)}`, 'info', 3000);
+}
+
+/** Wait briefly for a part to finish its first load (STEP conversion may take longer; it still shows up). */
+async function settled(key, ms = 5000) {
+  for (let t = 0; t < ms; t += 100) {
+    const entry = parts.get(key);
+    if (entry && entry.status !== 'loading') return entry;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return parts.get(key) ?? null;
+}
+
+function revealAll() {
+  afterSceneChange(false);
+  const box = visibleBox();
+  if (!box.isEmpty()) fitTo(box);
+}
+
 // ---------------------------------------------------------------- live connection
 let events = null;
 let offlineTimer = null;
@@ -1889,9 +1983,11 @@ function connect() {
     if (msg.type === 'hello') {
       void refreshScene();
       for (const id of rootsInUse()) void syncFiles(id);
+      void applyRequests(); // the server may have restarted while we were away
     } else if (msg.type === 'scene') void refreshScene();
     else if (msg.type === 'files' && typeof msg.root === 'string' && rootsInUse().has(msg.root)) void syncFiles(msg.root);
     else if (msg.type === 'roots') void loadRoots().catch(() => {});
+    else if (msg.type === 'request') void applyRequests();
     else if (msg.type === 'selection' && msg.client !== clientId) void loadSelection(); // ignore our own echo
     else if (msg.type === 'watch-lost') {
       events?.close();
@@ -1899,6 +1995,15 @@ function connect() {
     }
   };
 }
+// Close the live connection when the page goes away, so the Node side knows no viewer is
+// listening (the AI is told to ask the user to open it). Reconnect if the page comes back.
+window.addEventListener('pagehide', () => {
+  events?.close();
+  events = null;
+});
+window.addEventListener('pageshow', (ev) => {
+  if (ev.persisted && !events) connect();
+});
 
 // ---------------------------------------------------------------- boot
 const hostBridge = createHostBridge();
@@ -1957,5 +2062,6 @@ async function boot() {
   afterSceneChange(false);
   await loadSelection();
   connect();
+  await applyRequests(); // models the AI asked for while the viewer was closed
 }
 void boot();
