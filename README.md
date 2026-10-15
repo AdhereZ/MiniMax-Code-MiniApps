@@ -66,7 +66,7 @@ The MiniMax Code Agent communicates through the host MCP client. Business reques
 | [Git Commit Tree](plugins/microbiosis/git-tree/) | Inspect a local Git repo's commit history with a swim-lane graph, branches/tags, commit detail, and per-file change stats; persisted filter preferences and optional auto-refresh | [Microbiosis](https://github.com/Microbiosis) |
 | [灵签易占 / Chinese Divination](plugins/weekbin/chinese-divination/) | Cast hexagrams with the Plum Blossom method (time, number, three-coin, or daily), read the result through the classical body/use rules, and browse all sixty-four hexagrams with a ganzhi almanac | [weekbin](https://github.com/weekbin) |
 | [Session Trajectory](plugins/avatasia/mmc-trajectory/) | Browse a conversation's model trajectory: messages, reasoning, tool calls and results, Token usage, and per-turn timing | [avatasia](https://github.com/avatasia) |
-| [CadQuery Viewer](plugins/hanzijie/cq-viewer/) | View STL / STEP models from your project (STEP keeps assembly part names, colours, and real CAD edges), watch models pushed from CadQuery scripts, and mark positions on the model to send to the conversation in one click | [HanZijie](https://github.com/HanZijie) |
+| [CadQuery Viewer](plugins/hanzijie/cq-viewer/) | View STL / STEP models from your project (STEP keeps assembly part names, colours, and real CAD edges), watch models pushed from CadQuery scripts, and mark positions on the model to send to the conversation in one click; MCP tools let the AI add model folders and open models, and a CadQuery parametric-design skill is bundled | [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai) |
 
 <details>
 <summary>Preview: Token Usage Board</summary>

@@ -16,5 +16,10 @@
   "surface": {
     "path": "/viewer"
   },
-  "mcpEndpoints": []
+  "mcpEndpoints": [
+    {
+      "server": "cq-viewer",
+      "path": "/mcp/cq-viewer"
+    }
+  ]
 }

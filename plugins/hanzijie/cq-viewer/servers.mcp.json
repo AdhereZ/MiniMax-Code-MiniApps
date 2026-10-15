@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "mcpServers": {
+    "cq-viewer": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9/mcp/cq-viewer",
+      "headers": {},
+      "description": "CadQuery Viewer：登记模型文件夹、在查看器里打开 STL / STEP 模型、列出已登记的文件夹和模型。",
+      "timeout": 120000
+    }
+  }
+}

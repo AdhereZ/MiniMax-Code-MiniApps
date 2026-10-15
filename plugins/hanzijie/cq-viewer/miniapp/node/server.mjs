@@ -6,17 +6,34 @@
 //   ~/.cqview/scene/scene.json   optional per-part colour/opacity               (read)
 //   ~/.cqview/roots.json         registered folders the page may browse          (read/write)
 //   ~/.cqview/selection.json     last picked points, resolved to absolute files  (write)
+//   <dataDir>/open-requests.json what the AI asked the page to open (MCP tools)  (read/write)
 //
 // Folder browsing is scoped: only folders registered in roots.json, only inside the
 // user's home directory, only .stl/.step/.stp files, no symlinks, no hidden folders.
+// The MCP endpoint (mcp.mjs) only answers loopback requests and reuses the same rules;
+// its one extra power is copy_to_scene, which copies a model file into ~/.cqview/scene.
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, watch } from 'node:fs';
-import { access, lstat, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import {
+  access,
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { basename, extname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
+
+import { createMcpHandler, MCP_PATH } from './mcp.mjs';
 
 /** @typedef {import('./miniapp-api.js').MiniAppContext} MiniAppContext */
 /** @typedef {import('./miniapp-api.js').MiniAppLifecycle} MiniAppLifecycle */
@@ -50,6 +67,12 @@ const PY_PROBE_TIMEOUT_MS = 60_000;
 const STEP_TIMEOUT_MS = 300_000;
 const STEP_MESH_VERSION = 'cqvm-1';
 const CQVM_TYPE = 'application/x-cqview-mesh';
+const REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_REQUESTS = 20;
+const REQUEST_TYPES = new Set(['folder', 'file', 'scene']);
+const MCP_LIST_LIMIT = 200;
+const MAX_COPY_BYTES = 512 * 1024 * 1024;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
 const STEP_TO_STL_PY = [
   'import sys',
@@ -93,7 +116,20 @@ export async function start(context) {
   const clientRoot = join(context.pluginRoot, 'miniapp', 'client');
   const indexHtml = await readFile(join(clientRoot, 'index.html'));
   const stepCacheDir = join(context.dataDir, 'step-cache');
+  const requestsFile = join(context.dataDir, 'open-requests.json');
   const log = context.logger;
+
+  /** Read-modify-write of our JSON files runs one at a time (page and AI can write together). */
+  let writeChain = Promise.resolve();
+  /** @template T @param {() => Promise<T>} fn @returns {Promise<T>} */
+  const serial = (fn) => {
+    const run = writeChain.then(fn, fn);
+    writeChain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  };
 
   /** @type {Set<import('node:child_process').ChildProcess>} */
   const children = new Set();
@@ -237,16 +273,241 @@ export async function start(context) {
   /** @param {unknown} input */
   const addRoot = async (input) => {
     const real = await validateRootPath(input);
-    const roots = await readRoots();
-    const next = [{ path: real, used: new Date().toISOString() }, ...roots.filter((r) => r.path !== real)].slice(
-      0,
-      MAX_ROOTS,
-    );
-    await writeJsonAtomic(ROOTS_FILE, { roots: next }); // commit first …
+    await serial(async () => {
+      const roots = await readRoots();
+      const next = [{ path: real, used: new Date().toISOString() }, ...roots.filter((r) => r.path !== real)].slice(
+        0,
+        MAX_ROOTS,
+      );
+      await writeJsonAtomic(ROOTS_FILE, { roots: next }); // commit first …
+    });
     await syncRootWatchers();
     broadcast({ type: 'roots' }); // … then notify
     return describeRoot(real);
   };
+
+  // ---------- domain: requests from the AI (MCP) for the page ----------
+  /** @returns {Promise<{epoch: string|null, seq: number, items: Record<string, unknown>[]}>} */
+  const readRequests = async () => {
+    try {
+      const parsed = JSON.parse(await readFile(requestsFile, 'utf8'));
+      if (parsed && typeof parsed.epoch === 'string' && Number.isInteger(parsed.seq) && Array.isArray(parsed.items)) {
+        const now = Date.now();
+        const items = parsed.items.filter(
+          (/** @type {any} */ it) =>
+            it &&
+            Number.isInteger(it.seq) &&
+            typeof it.at === 'string' &&
+            now - Date.parse(it.at) < REQUEST_TTL_MS &&
+            REQUEST_TYPES.has(it.type) &&
+            (it.type === 'scene'
+              ? typeof it.name === 'string' && PART_NAME_RE.test(it.name)
+              : typeof it.root === 'string' && ROOT_ID_RE.test(it.root) && (it.type === 'folder' || typeof it.rel === 'string')),
+        );
+        return { epoch: parsed.epoch, seq: parsed.seq, items };
+      }
+    } catch {
+      /* none yet */
+    }
+    return { epoch: null, seq: 0, items: [] };
+  };
+
+  /** Persist a request (the page may not be open, or the process may restart), then notify. */
+  const pushRequest = async (/** @type {Record<string, unknown>} */ req) => {
+    const seq = await serial(async () => {
+      const doc = await readRequests();
+      const next = doc.seq + 1;
+      const items = [...doc.items, { seq: next, at: new Date().toISOString(), ...req }].slice(-MAX_REQUESTS);
+      await writeJsonAtomic(requestsFile, { epoch: doc.epoch ?? randomBytes(6).toString('hex'), seq: next, items });
+      return next;
+    });
+    broadcast({ type: 'request', seq });
+    return seq;
+  };
+
+  const viewerConnected = () => clients.size > 0;
+
+  /** @param {string} p */
+  const folderInfo = (p) => ({ id: rootId(p), path: p, label: basename(p) });
+
+  /** @param {string} rootPath @param {{rel: string, size: number, kind: string}[]} files */
+  const modelList = (rootPath, files) =>
+    files.slice(0, MCP_LIST_LIMIT).map((f) => ({ path: join(rootPath, ...f.rel.split('/')), kind: f.kind, size: f.size }));
+
+  /** @param {{path: string, select?: boolean}} args */
+  const addModelFolder = async (args) => {
+    const real = await validateRootPath(args.path);
+    await addRoot(real);
+    const { files, truncated } = await listModels(real);
+    if (args.select !== false) await pushRequest({ type: 'folder', root: rootId(real) });
+    return {
+      folder: folderInfo(real),
+      model_count: files.length,
+      truncated,
+      models: modelList(real, files),
+      viewer_connected: viewerConnected(),
+    };
+  };
+
+  /** @param {{path: string, copy_to_scene?: boolean, name?: string, color?: string, opacity?: number}} args */
+  const addModelFile = async (args) => {
+    const src = await validateModelPath(args.path);
+    if (args.copy_to_scene) return copyToScene(src, args);
+    if (args.name !== undefined || args.color !== undefined || args.opacity !== undefined) {
+      throw new HttpError(400, 'copy_only_option', 'name、color、opacity 只在 copy_to_scene 为 true 时可用');
+    }
+    if (basename(src.real).startsWith('.')) throw new HttpError(400, 'hidden_file', '不能打开隐藏文件');
+    if (!isAllowedRoot(dirname(src.real))) {
+      throw new HttpError(
+        400,
+        'outside_home',
+        '只能原地打开用户主目录内的文件（不能直接放在主目录下，也不能在 ~/Library 或隐藏的顶层目录里）；其他位置的文件请加 copy_to_scene: true',
+      );
+    }
+    // closest registered folder that really lists the file, else register its own folder
+    const candidates = (await readRoots())
+      .filter((r) => src.real.startsWith(r.path + sep))
+      .sort((a, b) => b.path.length - a.path.length);
+    /** @type {{rootPath: string, rel: string} | null} */
+    let chosen = null;
+    for (const r of candidates) {
+      const rel = relative(r.path, src.real).split(sep).join('/');
+      if (!isListableRel(rel)) continue;
+      const { files } = await listModels(r.path);
+      if (files.some((f) => f.rel === rel)) {
+        chosen = { rootPath: r.path, rel };
+        break;
+      }
+    }
+    if (!chosen) {
+      const dir = dirname(src.real);
+      const rel = basename(src.real);
+      await validateRootPath(dir);
+      const { files } = await listModels(dir);
+      if (!files.some((f) => f.rel === rel)) {
+        throw new HttpError(422, 'not_listed', '这个文件所在的文件夹模型太多，查看器列不出它');
+      }
+      chosen = { rootPath: dir, rel };
+    }
+    await addRoot(chosen.rootPath); // registers it, or marks it recently used
+    await pushRequest({ type: 'file', root: rootId(chosen.rootPath), rel: chosen.rel });
+    return {
+      mode: 'reference',
+      path: src.real,
+      kind: src.ext === '.stl' ? 'stl' : 'step',
+      size: src.stat.size,
+      folder: folderInfo(chosen.rootPath),
+      rel: chosen.rel,
+      viewer_connected: viewerConnected(),
+      note: '原地打开：之后重新导出这个文件，查看器会自动刷新，不用再调用。',
+    };
+  };
+
+  /**
+   * Copy a model file into the pushed scene, like cqview.show_file().
+   * @param {{real: string, stat: import('node:fs').Stats, ext: string}} src
+   * @param {{name?: string, color?: string, opacity?: number}} opts
+   */
+  const copyToScene = async (src, opts) => {
+    const name = opts.name ?? sceneNameFrom(src.real);
+    if (!PART_NAME_RE.test(name)) throw new HttpError(400, 'invalid_name', '模型名只能用字母、数字、. _ -，且不能以 . 开头');
+    if (src.stat.size === 0) throw new HttpError(422, 'empty_file', '这个文件是空的');
+    if (src.stat.size > MAX_COPY_BYTES) throw new HttpError(413, 'file_too_large', '文件超过 512 MB，不能复制');
+    const dst = join(SCENE_DIR, `${name}${src.ext}`);
+    await serial(async () => {
+      await mkdir(SCENE_DIR, { recursive: true });
+      const tmp = join(SCENE_DIR, `.${name}.${process.pid}.${Date.now()}.tmp`);
+      try {
+        await copyFile(src.real, tmp);
+        await rename(tmp, dst);
+      } finally {
+        await unlink(tmp).catch(() => {});
+      }
+      for (const ext of MODEL_EXT) {
+        if (ext !== src.ext) await unlink(join(SCENE_DIR, `${name}${ext}`)).catch(() => {});
+      }
+      await setSceneMeta(name, opts);
+    });
+    await pushRequest({ type: 'scene', name });
+    return {
+      mode: 'copy',
+      name,
+      scene_file: dst,
+      source: src.real,
+      kind: src.ext === '.stl' ? 'stl' : 'step',
+      size: src.stat.size,
+      viewer_connected: viewerConnected(),
+      note: '这是一份副本：源文件之后的修改不会同步，需要时再调用一次。',
+    };
+  };
+
+  /** Same rules as cqview.py: a push replaces the part's colour/opacity with what was given. */
+  const setSceneMeta = async (/** @type {string} */ name, /** @type {{color?: string, opacity?: number}} */ opts) => {
+    const file = join(SCENE_DIR, 'scene.json');
+    /** @type {{parts: Record<string, unknown>}} */
+    let meta = { parts: {} };
+    try {
+      const parsed = JSON.parse(await readFile(file, 'utf8'));
+      if (parsed && typeof parsed === 'object' && parsed.parts && typeof parsed.parts === 'object') meta = parsed;
+    } catch {
+      /* missing or unreadable: start fresh */
+    }
+    /** @type {Record<string, unknown>} */
+    const entry = {};
+    if (opts.color !== undefined) entry.color = opts.color.toLowerCase();
+    if (opts.opacity !== undefined) entry.opacity = clamp(opts.opacity, 0.05, 1);
+    const had = Object.hasOwn(meta.parts, name);
+    if (!had && !Object.keys(entry).length) return;
+    if (Object.keys(entry).length) meta.parts[name] = entry;
+    else delete meta.parts[name];
+    await writeJsonAtomic(file, meta);
+  };
+
+  /** @param {{folder?: string}} args */
+  const listModelFolders = async (args) => {
+    const roots = await readRoots();
+    if (args.folder === undefined) {
+      const folders = [];
+      for (const r of roots) {
+        const st = await stat(r.path).catch(() => null);
+        folders.push({ ...folderInfo(r.path), exists: !!st && st.isDirectory(), last_used: r.used ?? null });
+      }
+      const scene = await readScene();
+      return {
+        folders,
+        scene: {
+          dir: SCENE_DIR,
+          models: scene.parts.map((p) => ({ name: p.name, path: join(SCENE_DIR, p.file), kind: p.kind, size: p.size })),
+        },
+        viewer_connected: viewerConnected(),
+      };
+    }
+    let root = ROOT_ID_RE.test(args.folder) ? roots.find((r) => rootId(r.path) === args.folder) : undefined;
+    if (!root) {
+      let p = args.folder.trim();
+      if (p === '~' || p.startsWith('~/')) p = join(HOME, p.slice(1));
+      const real = isAbsolute(p) ? await realpath(p).catch(() => null) : null;
+      root = real ? roots.find((r) => r.path === real) : undefined;
+    }
+    if (!root) throw new HttpError(404, 'root_not_registered', '这个文件夹还没有登记，先调用 add_model_folder');
+    const st = await stat(root.path).catch(() => null);
+    if (!st || !st.isDirectory()) throw new HttpError(404, 'root_missing', '文件夹已不存在');
+    const { files, truncated } = await listModels(root.path);
+    return {
+      folder: folderInfo(root.path),
+      model_count: files.length,
+      truncated,
+      models: modelList(root.path, files),
+      viewer_connected: viewerConnected(),
+    };
+  };
+
+  const handleMcp = createMcpHandler({
+    addModelFolder,
+    addModelFile,
+    listModelFolders,
+    log: (message) => log.info(message),
+  });
 
   /** @param {string} file @param {import('node:fs').Stats} st @returns {Promise<{path: string, type: 'cqvm'|'stl'}>} */
   const stepToMesh = async (file, st) => {
@@ -446,6 +707,25 @@ export async function start(context) {
     const path = url.pathname;
     const method = request.method ?? 'GET';
 
+    // MCP: the Host's MCP client calls this over loopback. Refuse anything a browser page on another
+    // origin (or a DNS-rebound hostname) could send.
+    if (path === MCP_PATH) {
+      if (!isLoopbackRequest(request)) return sendJson(response, 403, { error: 'forbidden' });
+      if (method !== 'POST') {
+        response.writeHead(405, { allow: 'POST', 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ error: 'method_not_allowed' }));
+        return;
+      }
+      const body = await readJsonBody(request);
+      const reply = await handleMcp(body);
+      if (reply === null) {
+        response.writeHead(202);
+        response.end();
+        return;
+      }
+      return sendJson(response, 200, reply);
+    }
+
     if (method === 'GET' && path === BASE) {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
       response.end(indexHtml);
@@ -511,6 +791,9 @@ export async function start(context) {
       const body = await readJsonBody(request);
       return sendJson(response, 200, await writeSelection(body));
     }
+
+    // what the AI asked the page to open
+    if (method === 'GET' && path === `${BASE}/api/requests`) return sendJson(response, 200, await readRequests());
 
 
     // live updates
@@ -703,6 +986,71 @@ async function resolveModel(rootPath, rel) {
   return { full, stat: st, kind: /** @type {'stl'|'step'} */ (ext === '.stl' ? 'stl' : 'step') };
 }
 
+/**
+ * A model file named by the AI: absolute (or ~/), an allowed extension, a regular file.
+ * Symbolic links are resolved; every later rule applies to the real path.
+ * @param {unknown} input
+ */
+async function validateModelPath(input) {
+  if (typeof input !== 'string' || !input.trim() || input.length > 1024 || input.includes('\0')) {
+    throw new HttpError(400, 'invalid_path', '请提供模型文件的绝对路径');
+  }
+  let p = input.trim();
+  if (p === '~' || p.startsWith('~/')) p = join(HOME, p.slice(1));
+  if (!isAbsolute(p)) throw new HttpError(400, 'invalid_path', '请提供绝对路径（可用 ~/ 开头）');
+  if (!MODEL_EXT.has(extname(p).toLowerCase())) throw new HttpError(400, 'unsupported_type', '只支持 .stl、.step、.stp 文件');
+  let real;
+  try {
+    real = await realpath(p);
+  } catch {
+    throw new HttpError(404, 'file_not_found', '文件不存在');
+  }
+  const ext = extname(real).toLowerCase();
+  if (!MODEL_EXT.has(ext)) throw new HttpError(400, 'unsupported_type', '只支持 .stl、.step、.stp 文件');
+  const st = await stat(real);
+  if (!st.isFile()) throw new HttpError(400, 'not_a_file', '这不是文件');
+  return { real, stat: st, ext };
+}
+
+/** Would listModels() list this path, relative to its folder? */
+function isListableRel(/** @type {string} */ rel) {
+  const segs = rel.split('/');
+  if (segs.length - 1 > WALK_MAX_DEPTH) return false;
+  return segs.every((s, i) => !!s && !s.startsWith('.') && (i === segs.length - 1 || !SKIP_DIRS.has(s)));
+}
+
+/** Scene name from a file name, like cqview.show_file(). */
+function sceneNameFrom(/** @type {string} */ file) {
+  const stem = basename(file, extname(file))
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 100);
+  return stem || 'model';
+}
+
+/**
+ * Host must be loopback (blocks DNS rebinding); Origin, when a browser sends one, too.
+ * The Host's MCP client is a Node process and sends no Origin.
+ * @param {import('node:http').IncomingMessage} request
+ */
+function isLoopbackRequest(request) {
+  const host = request.headers.host;
+  if (host !== undefined && !LOOPBACK_HOSTS.has(hostnameOf(host))) return false;
+  const origin = request.headers.origin;
+  if (origin === undefined) return true;
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(\[[^\]]*\]|[^/:?#]+)/i.exec(origin);
+  return !!m && LOOPBACK_HOSTS.has(hostnameOf(m[1]));
+}
+
+/** @param {string} hostHeader */
+function hostnameOf(hostHeader) {
+  const h = hostHeader.trim().toLowerCase();
+  const bracketed = /^\[([^\]]*)\]/.exec(h);
+  if (bracketed) return bracketed[1];
+  const colon = h.lastIndexOf(':');
+  return colon === -1 ? h : h.slice(0, colon);
+}
+
 // ---------------------------------------------------------------- helpers
 
 /** @param {unknown} raw */
@@ -784,7 +1132,7 @@ function clamp(v, lo, hi) {
 
 /** @param {string} file @param {unknown} data */
 async function writeJsonAtomic(file, data) {
-  await mkdir(EXCHANGE_DIR, { recursive: true });
+  await mkdir(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   await rename(tmp, file);
