@@ -1,0 +1,9 @@
+{
+  "name": "minimax-bot-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "ajv": "8.18.0",
+    "jsdom": "24.1.3"
+  }
+}
