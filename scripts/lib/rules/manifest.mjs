@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import {
+  AGENT_PATH,
   APP_PATH,
   CATEGORIES,
   HOOK_PATH,
@@ -67,8 +68,9 @@ export async function checkManifest(report, { packageDir, manifest }) {
   await references(report, packageDir, manifest.skills, 'skills', SKILL_PATH, { required: true, mustExist: true });
   await references(report, packageDir, manifest.hooks, 'hooks', HOOK_PATH, { required: false, mustExist: true });
   await references(report, packageDir, manifest.hostBindings, 'hostBindings', HOST_BINDING_PATH, { required: false, mustExist: true });
+  await references(report, packageDir, manifest.agents, 'agents', AGENT_PATH, { required: false, mustExist: true });
 
-  const identity = {};
+  const identity = { features: manifest.agents === undefined ? [] : ['agents'] };
   if (name !== undefined) identity.name = name;
   if (icon !== undefined) identity.icon = icon;
   if (darkIcon !== undefined) identity.darkIcon = darkIcon;
