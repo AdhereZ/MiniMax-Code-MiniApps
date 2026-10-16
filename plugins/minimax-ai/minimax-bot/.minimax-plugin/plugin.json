@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "name": "minimax-bot",
+  "displayName": "MiniMax Bot",
+  "version": "0.7.2",
+  "description": "Turn MiniMax Code into an always-on team of Bots. A Chief Bot helps you build the team; in group chats the admin answers and @mentions hand work to other members. Every Bot has its own octopus avatar and memory, with scheduled tasks and usage stats.",
+  "author": "MiniMax Code",
+  "icon": "icon.png",
+  "category": "Productivity",
+  "exampleQueries": [
+    "Open MiniMax Bot and have Chief set up a small writing team",
+    "Create a MiniMax Bot group where a writer and a programmer co-author a tech blog post",
+    "Have MiniMax Bot put together an industry news digest every morning at 9"
+  ],
+  "apps": [],
+  "mcpServers": [
+    "servers.mcp.json"
+  ],
+  "skills": []
+}
