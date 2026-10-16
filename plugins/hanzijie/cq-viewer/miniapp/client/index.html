@@ -154,13 +154,14 @@
       标注 <span id="annot-fab-count"></span>
     </button>
 
-    <!-- pick confirmation -->
-    <div id="confirm-bar" class="confirm-bar" role="region" aria-label="选点确认" hidden>
-      <span id="confirm-text" class="confirm-text">在模型上点击要标注的位置，可以连续选多个</span>
+    <!-- pick bar: first points wait for 确认; after that every click goes straight into the list -->
+    <div id="confirm-bar" class="confirm-bar" role="region" aria-label="选点" data-mode="batch" hidden>
+      <span id="confirm-text" class="confirm-text" aria-live="polite">在模型上点击要标注的位置，可以连续选多个</span>
       <div class="confirm-actions">
         <button id="pending-undo" type="button" class="btn ghost" disabled>撤销上一个</button>
         <button id="pending-cancel" type="button" class="btn ghost">取消</button>
         <button id="pending-confirm" type="button" class="btn btn-primary" disabled>确认</button>
+        <button id="pick-done" type="button" class="btn btn-primary" title="结束选点（Esc）" hidden>完成</button>
       </div>
     </div>
 

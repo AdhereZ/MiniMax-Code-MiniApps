@@ -9,7 +9,7 @@
 
 A local 3D viewer for MiniMax Code. Open STL and STEP models from your project folder — STEP assemblies keep their part names, colours, and real CAD edges — watch models pushed live from CadQuery scripts, then mark positions on the model and send them to the conversation in one click, so the AI knows exactly which face, hole, or edge you mean. The AI can register model folders and open models in the viewer through MCP tools, and the package bundles flowful-ai's CadQuery parametric-design skill.
 
-Authors: [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai) (bundled CadQuery skill) · Version: `1.1.1`
+Authors: [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai) (bundled CadQuery skill) · Version: `1.2.0`
 
 ![CadQuery Viewer: a STEP assembly with three annotations ready to send](docs/preview.jpg)
 
@@ -21,7 +21,7 @@ Authors: [HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.
 | Project folders | Lists every `.stl`, `.step`, `.stp` in a folder (recursive); tick a file to open it. Open files reload when they change on disk. |
 | STEP | Converted locally into a mesh that keeps the assembly: part names, placements, colours, and B-rep edges (seam lines hidden). The "Opened" list shows how many parts a file has. Results are cached. |
 | CadQuery push | `python/cqview.py` → `show(part_or_assembly, "name")` writes into `~/.cqview/scene/`; the Viewer shows it immediately. Assemblies are pushed as STEP so names and colours survive. |
-| Annotate | Pick mode (`P`): click several points on the surface, then confirm (`Enter`). Each point records part, sub-part (for assemblies), coordinates, and surface normal; add a note per point plus one instruction for the AI. |
+| Annotate | Pick mode (`P`): click the first points on the surface and confirm them (`Enter`). Pick mode then stays on: every further click goes straight into the annotation list with its note box focused, so you can pick a point, write what you want there, and pick the next one. Each point records part, sub-part (for assemblies), coordinates, and surface normal; add a note per point plus one instruction for the AI. |
 | Send to AI | One button sends the composed message to the conversation (see [Sending to the conversation](#sending-to-the-conversation)). The same data is kept in `~/.cqview/selection.json` for agents and scripts. |
 | AI tools (MCP) | `add_model_folder`, `add_model_file`, `list_model_folders` — the AI registers folders and opens the models it just exported; an open viewer switches to them at once, a closed one does so when it next opens (see [AI tools](#ai-tools-mcp)). |
 | CadQuery skill | `parametric-3d-printing` from [flowful-ai/cad-skill](https://github.com/flowful-ai/cad-skill): requirements → phased CadQuery modelling → STL/STEP export → watertight check → multi-view preview, plus a tested Gridfinity generator (see [Bundled CadQuery skill](#bundled-cadquery-skill)). |
@@ -45,16 +45,16 @@ Keep the hidden `.minimax-plugin/` directory. Restart MiniMax Code, then open "C
 
 1. **Pick a folder.** Click the folder icon on the left, then **+** to add a folder (any folder inside your home directory). The assistant can also do this with `add_model_folder`, or open the page with `/viewer?root=<absolute folder path>`.
 2. **Open models.** Tick files in the list, or let the assistant call `add_model_file`. Use the toolbar at the bottom for views, fit (`F`), edges, grid, and section.
-3. **Annotate.** Press **选点** (`P`), click points on the model, press **确认** (`Enter`). Write a note for each point and what you want the AI to do.
+3. **Annotate.** Press **选点** (`P`), click points on the model, press **确认** (`Enter`). The panel opens and you stay in pick mode: write the note for a point, click the next point (it joins the list right away and its note box takes the focus), and so on. Write what you want the AI to do whenever you like. Press **完成** or `Esc` to stop picking; pressing **选点** again later continues the same list.
 4. **Send.** Press **发送到对话** (`⌘/Ctrl + Enter` in the instruction box).
 
 | Key | Action |
 | --- | --- |
 | `P` | Enter / leave pick mode |
-| `Enter` | Confirm the picked points |
-| `Backspace` | Remove the last unconfirmed point |
-| `Esc` | Close popover → leave pick mode → close panel |
-| `⌘/Ctrl + Z` | Undo the last annotation change |
+| `Enter` | Confirm the first picked points (later points need no confirmation) |
+| `Backspace` | Remove the last point picked since 选点 was pressed (not while typing) |
+| `Esc` | Leave a text box → close popover → leave pick mode → close panel |
+| `⌘/Ctrl + Z` | Undo the last added / removed annotation (notes written since are kept) |
 | `F` | Fit the view |
 
 ### AI tools (MCP)
@@ -140,9 +140,9 @@ The model path is validated first (registered folder, allowed extension, no symb
 ## Tested environment
 
 - MiniMax Code desktop `3.1.1-preview.4597` (Electron 42), macOS 26 (Apple Silicon); Python 3.9 with CadQuery 2.5.2 / OCP 7.7.2, trimesh 4.12, pyrender 0.1.45.
-- In MiniMax Code (1.1.1): local install; the page opened with `?root=` reads and registers folders under the new Host/Origin checks, and `list_model_folders` reports `viewer_connected: true` while the panel is open. (1.1.0): local install; a new conversation lists `mcp__cq-viewer__add_model_folder`, `mcp__cq-viewer__add_model_file`, `mcp__cq-viewer__list_model_folders` and the skill `cq-viewer:parametric-3d-printing`; `list_model_folders` and `add_model_folder` (`select: false`) called through the Host. Earlier (1.0.0): open, folder registration via `?root=`, and Host bridge detection (the `ui/initialize` handshake is not answered in this build, so the fallback path is used).
+- In MiniMax Code (1.2.0): local install and open; continuous picking itself was exercised in headless Chrome (below). (1.1.1): local install; the page opened with `?root=` reads and registers folders under the new Host/Origin checks, and `list_model_folders` reports `viewer_connected: true` while the panel is open. (1.1.0): local install; a new conversation lists `mcp__cq-viewer__add_model_folder`, `mcp__cq-viewer__add_model_file`, `mcp__cq-viewer__list_model_folders` and the skill `cq-viewer:parametric-3d-printing`; `list_model_folders` and `add_model_folder` (`select: false`) called through the Host. Earlier (1.0.0): open, folder registration via `?root=`, and Host bridge detection (the `ui/initialize` handshake is not answered in this build, so the fallback path is used).
 - `node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs` — 19 tests against the real Node entry with a temporary home directory. `tests/mcp.test.mjs`: the three tools, folder rules, copy to scene with colour, request log across a restart, loopback/JSON checks. `tests/server.test.mjs`: 40 concurrent annotation saves and 8 concurrent folder registrations (page and MCP mixed) without errors or lost entries; with a fake Python, dispose during a STEP conversion kills it and starts no fallback, a killed conversion does not fall back, a `SIGSEGV` crash does; step-cache pruning; Host/Origin checks on every route; versions in sync.
-- End-to-end in headless Chrome against the same Node entry: the page switches folder and opens the file when the AI calls the tools; `copy_to_scene` shows the copied part in its colour; a file requested while the page is closed opens on the next visit, is not replayed after that, and stays closed once you untick it; `viewer_connected` turns false when the page goes away. From 1.0.0: STL and STEP opening (multi-level assemblies with names, colours, instances), live reload, pick → confirm → notes, the `ui/message` path against a simulated MCP Apps host, the fallback path against a simulated page bridge, and copy mode without a Host.
+- End-to-end in headless Chrome against the same Node entry, at 1400 px and 800 px wide (19 checks each): the first points are confirmed and pick mode stays on; further clicks join the list directly while a note box or the instruction box is being edited, focus moves to the new point's note, notes already written are kept; 撤销上一个 / `Backspace` remove the last point of the session; `⌘Z` restores it and keeps notes edited in between; `Esc` twice and 完成 leave pick mode; pressing 选点 again continues without confirmation; a collapsed panel reopens on a new point; after 清空标注 the confirm step returns; `selection.json` has the points, notes, and instruction; the panel stays clear of the pick bar. From 1.1.0: the page switches folder and opens the file when the AI calls the tools; `copy_to_scene` shows the copied part in its colour; a file requested while the page is closed opens on the next visit, is not replayed after that, and stays closed once you untick it; `viewer_connected` turns false when the page goes away. From 1.0.0: STL and STEP opening (multi-level assemblies with names, colours, instances), live reload, pick → confirm → notes, the `ui/message` path against a simulated MCP Apps host, the fallback path against a simulated page bridge, and copy mode without a Host.
 - Bundled skill: `run_cadquery_model.py --preview --strict` run from the installed plugin directory (model → STL → watertight check → preview PNG).
 - Not verified: Windows; `add_model_file` through the Host with the viewer panel open (the page side was verified in headless Chrome only); that the Send fallback actually fills the conversation input in this build; STEP files with face-level colours from other CAD tools; the skill's Gridfinity generator with CadQuery 2.5 (the skill asks for 2.6.1 or later).
 

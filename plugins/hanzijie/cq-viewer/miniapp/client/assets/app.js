@@ -110,6 +110,7 @@ const el = {
   pendingUndo: /** @type {HTMLButtonElement} */ ($('pending-undo')),
   pendingCancel: /** @type {HTMLButtonElement} */ ($('pending-cancel')),
   pendingConfirm: /** @type {HTMLButtonElement} */ ($('pending-confirm')),
+  pickDone: /** @type {HTMLButtonElement} */ ($('pick-done')),
   infoSize: $('info-size'),
   infoCenter: $('info-center'),
   infoGrid: $('info-grid'),
@@ -1113,15 +1114,20 @@ function applyClip() {
 
 // ---------------------------------------------------------------- annotations (positions on parts)
 /**
- * @typedef {{x:number,y:number,z:number,part:string|null,body?:string,ref?:PartRef,
+ * @typedef {{id:number,x:number,y:number,z:number,part:string|null,body?:string,ref?:PartRef,
  *   normal?:{x:number,y:number,z:number},note?:string}} Pick
  */
 const MAX_PICKS = 50;
 /** Confirmed annotations (persisted, sent to the AI). @type {Pick[]} */
 let picks = [];
-/** Points chosen in pick mode, waiting for 确认. @type {Pick[]} */
+/** First points of a session, waiting for 确认 (only while there are no annotations yet). @type {Pick[]} */
 let pending = [];
 let pickMode = false;
+/** Ids of the annotations added since pick mode was turned on, for 撤销上一个. @type {number[]} */
+let sessionAdded = [];
+/** In-page id, so undo can keep notes written after a point was added. Never persisted. */
+let pickSeq = 0;
+const nextPickId = () => ++pickSeq;
 /** @type {Pick[][]} */
 const undoStack = [];
 let activePick = -1;
@@ -1160,6 +1166,7 @@ function pickFromHit(hit) {
   const body = entry ? bodyAt(entry, hit.faceIndex) : null;
   /** @type {Pick} */
   const p = {
+    id: nextPickId(),
     x: round(hit.point.x),
     y: round(hit.point.y),
     z: round(hit.point.z),
@@ -1181,11 +1188,17 @@ el.canvas.addEventListener('pointerup', (e) => {
   if (e.button !== 0 || !downAt) return;
   const moved = Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y);
   downAt = null;
-  if (moved <= 4 && pickMode) addPending(e);
+  if (moved <= 4 && pickMode) addPoint(e);
 });
 
-// ---- pick mode: choose several points, then confirm
-function addPending(e) {
+// ---- pick mode
+// The first points of a session are collected as "pending" and confirmed together, so a first
+// look around costs nothing. Once there are annotations, pick mode stays on and every click goes
+// straight into the list with its note box focused: pick a point, write what you want there,
+// pick the next one. The instruction box stays editable the whole time.
+const inBatch = () => picks.length === 0 || pending.length > 0;
+
+function addPoint(e) {
   const hit = hitAt(e.clientX, e.clientY);
   if (!hit) {
     showToast('请点在模型表面上', 'info', 1400);
@@ -1195,52 +1208,96 @@ function addPending(e) {
     showToast(`最多标注 ${MAX_PICKS} 个位置`, 'warning');
     return;
   }
-  pending = [...pending, pickFromHit(hit)];
-  renderPending();
+  const p = pickFromHit(hit);
+  if (inBatch()) {
+    pending = [...pending, p];
+    renderPickBar();
+    return;
+  }
+  sessionAdded.push(p.id);
+  annotOpen = true;
+  setPicks([...picks, p]);
+  focusNote(picks.length - 1);
 }
 
 function setPickMode(on) {
   if (pickMode === on) return;
   pickMode = on;
   pending = [];
+  sessionAdded = [];
   if (!on) hideHover();
   document.body.classList.toggle('picking', on);
   el.pickToggle.setAttribute('aria-pressed', String(on));
   el.confirmBar.hidden = !on;
-  renderPending();
+  renderPickBar();
 }
 
+/** Add the pending points to the list and keep picking. */
 function confirmPending() {
   if (!pending.length) return;
   const added = pending;
   const firstNew = picks.length;
-  setPickMode(false);
-  setPicks([...picks, ...added]);
+  pending = [];
+  sessionAdded.push(...added.map((p) => p.id));
   annotOpen = true;
-  updateAnnotVisibility();
+  setPicks([...picks, ...added]);
+  focusNote(firstNew);
+}
+
+function focusNote(i) {
   requestAnimationFrame(() => {
-    const notes = el.pickList.querySelectorAll('.note');
-    /** @type {HTMLInputElement | undefined} */ (notes[firstNew])?.focus();
+    const note = /** @type {HTMLInputElement | undefined} */ (el.pickList.querySelectorAll('.note')[i]);
+    if (!note) return;
+    note.focus({ preventScroll: true });
+    note.closest('li')?.scrollIntoView({ block: 'nearest' });
   });
 }
 
 function removeLastPending() {
   if (!pending.length) return false;
   pending = pending.slice(0, -1);
-  renderPending();
+  renderPickBar();
   return true;
 }
 
-function renderPending() {
-  const n = pending.length;
-  if (n) {
-    el.confirmText.replaceChildren('已选择 ', Object.assign(document.createElement('strong'), { textContent: String(n) }), ' 个位置');
-  } else {
-    el.confirmText.textContent = '在模型上点击要标注的位置，可以连续选多个';
+/** Newest annotation added in this pick session that still exists. */
+function lastSessionPickId() {
+  for (let k = sessionAdded.length - 1; k >= 0; k--) {
+    const id = sessionAdded[k];
+    if (picks.some((p) => p.id === id)) return id;
   }
-  el.pendingUndo.disabled = n === 0;
-  el.pendingConfirm.disabled = n === 0;
-  el.pendingConfirm.textContent = n ? `确认 ${n} 个位置` : '确认';
+  return null;
+}
+function removeLastSessionPick() {
+  const id = lastSessionPickId();
+  if (id === null) return false;
+  sessionAdded = sessionAdded.slice(0, sessionAdded.lastIndexOf(id));
+  setPicks(picks.filter((p) => p.id !== id)); // recorded: ⌘Z brings it back
+  return true;
+}
+/** 撤销上一个 / Backspace: the last pending point, else the last point added in this session. */
+function removeLastPoint() {
+  return removeLastPending() || removeLastSessionPick();
+}
+
+function renderPickBar() {
+  const batch = inBatch();
+  el.confirmBar.dataset.mode = batch ? 'batch' : 'continuous';
+  const strong = (n) => Object.assign(document.createElement('strong'), { textContent: String(n) });
+  if (batch) {
+    const n = pending.length;
+    if (n) el.confirmText.replaceChildren('已选择 ', strong(n), ' 个位置');
+    else el.confirmText.textContent = '在模型上点击要标注的位置，可以连续选多个';
+    el.pendingUndo.disabled = n === 0;
+    el.pendingConfirm.disabled = n === 0;
+    el.pendingConfirm.textContent = n ? `确认 ${n} 个位置` : '确认';
+  } else {
+    el.confirmText.replaceChildren('继续点击模型，新位置直接加入标注 · 共 ', strong(picks.length), ' 处');
+    el.pendingUndo.disabled = lastSessionPickId() === null;
+  }
+  el.pendingCancel.hidden = !batch;
+  el.pendingConfirm.hidden = !batch;
+  el.pickDone.hidden = batch;
   syncMarkers();
 }
 
@@ -1259,7 +1316,13 @@ function setPicks(next, record = true) {
 function undoPicks() {
   const prev = undoStack.pop();
   if (!prev) return false;
-  picks = prev;
+  // Undo reverts which points exist, not what was written since: a point that is still there
+  // keeps its current note.
+  const live = new Map(picks.map((p) => [p.id, p]));
+  picks = prev.map((p) => {
+    const cur = live.get(p.id);
+    return cur && 'note' in cur ? { ...p, note: cur.note } : p;
+  });
   activePick = -1;
   renderPicks();
   void postSelection();
@@ -1343,7 +1406,7 @@ function syncMarkers() {
 }
 
 function renderPicks() {
-  syncMarkers();
+  renderPickBar(); // also redraws the markers
   el.pickList.replaceChildren(...picks.map((p, i) => pickItem(p, i)));
   el.pickEmpty.hidden = picks.length > 0;
   el.annotCount.textContent = picks.length ? String(picks.length) : '';
@@ -1585,6 +1648,7 @@ async function loadSelection() {
       .filter((p) => p && [p.x, p.y, p.z].every((v) => typeof v === 'number' && Number.isFinite(v)))
       .slice(0, MAX_PICKS)
       .map((p) => ({
+        id: nextPickId(),
         x: p.x,
         y: p.y,
         z: p.z,
@@ -1677,9 +1741,10 @@ el.rootName.addEventListener('click', () => openPanel('files'));
 
 // toolbar
 el.pickToggle.addEventListener('click', () => setPickMode(!pickMode));
-el.pendingUndo.addEventListener('click', () => removeLastPending());
+el.pendingUndo.addEventListener('click', () => removeLastPoint());
 el.pendingCancel.addEventListener('click', () => setPickMode(false));
 el.pendingConfirm.addEventListener('click', () => confirmPending());
+el.pickDone.addEventListener('click', () => setPickMode(false));
 
 el.fit.addEventListener('click', () => fitTo(visibleBox()));
 for (const b of el.viewButtons) {
@@ -1822,9 +1887,9 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'Enter' && pickMode && pending.length) {
     e.preventDefault();
     confirmPending();
-  } else if ((e.key === 'Backspace' || e.key === 'Delete') && pickMode && pending.length) {
+  } else if ((e.key === 'Backspace' || e.key === 'Delete') && pickMode && (pending.length || lastSessionPickId() !== null)) {
     e.preventDefault();
-    removeLastPending();
+    removeLastPoint();
   }
 });
 
@@ -2024,8 +2089,7 @@ async function boot() {
   void detectHostBridge();
   renderer.setClearColor(css('--cqv-canvas'), 1);
   resize();
-  renderPending();
-  renderPicks();
+  renderPicks(); // includes the pick bar
   renderParts();
 
   try {

@@ -9,7 +9,7 @@
 
 MiniMax Code 里的本地 3D 模型查看器。打开项目文件夹里的 STL 和 STEP（STEP 装配保留零件名称、颜色和真实 CAD 边线），实时显示 CadQuery 脚本推送的模型，在模型上标出位置后一键发到对话里，让 AI 准确知道你说的是哪个面、哪个孔、哪条边。AI 可以通过 MCP 工具登记模型文件夹、在查看器里打开模型；包里还内置了 flowful-ai 的 CadQuery 参数化建模 skill。
 
-作者：[HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai)（内置的 CadQuery skill） · 版本：`1.1.1`
+作者：[HanZijie](https://github.com/HanZijie) · [flowful-ai](https://github.com/flowful-ai)（内置的 CadQuery skill） · 版本：`1.2.0`
 
 ![CadQuery Viewer：一个 STEP 装配，已标注三个位置，准备发送](docs/preview.jpg)
 
@@ -21,7 +21,7 @@ MiniMax Code 里的本地 3D 模型查看器。打开项目文件夹里的 STL �
 | 项目文件夹 | 递归列出文件夹里的 `.stl`、`.step`、`.stp`，勾选即打开；文件在磁盘上变化时自动重新加载。 |
 | STEP | 在本机转换成网格，保留装配结构：零件名称、位置、颜色和 B-rep 边线（隐藏缝合线）。「已打开」里显示文件包含几个零件。转换结果会缓存。 |
 | CadQuery 推送 | `python/cqview.py` 的 `show(零件或装配, "名字")` 写入 `~/.cqview/scene/`，Viewer 立即显示。装配以 STEP 推送，名称和颜色都保留。 |
-| 标注 | 选点模式（`P`）：在表面上连续点多个位置，再确认（`Enter`）。每个点记录所在零件、装配里的子零件、坐标和表面法向；每个点可写备注，再写一句想让 AI 做什么。 |
+| 标注 | 选点模式（`P`）：先在表面上点几个位置并确认（`Enter`）。之后选点模式保持开启，每点一下就直接加入标注列表，并自动聚焦到它的备注框：点一个位置、写一句要求、再点下一个，想一步写一步。每个点记录所在零件、装配里的子零件、坐标和表面法向；每个点可写备注，再写一句想让 AI 做什么。 |
 | 发给 AI | 一个按钮把整理好的消息发到对话（见[发送到对话](#发送到对话)）。同样的数据也保存在 `~/.cqview/selection.json`，方便 Agent 和脚本读取。 |
 | AI 工具（MCP） | `add_model_folder`、`add_model_file`、`list_model_folders`：AI 登记文件夹、打开它刚导出的模型。查看器开着就立刻切过去，没开就在下次打开时执行（见 [AI 工具](#ai-工具mcp)）。 |
 | CadQuery skill | 来自 [flowful-ai/cad-skill](https://github.com/flowful-ai/cad-skill) 的 `parametric-3d-printing`：需求梳理 → 分阶段 CadQuery 建模 → 导出 STL/STEP → watertight 校验 → 多视角预览，另带一个经过测试的 Gridfinity 生成器（见[内置 CadQuery skill](#内置-cadquery-skill)）。 |
@@ -45,16 +45,16 @@ MiniMax Code 里的本地 3D 模型查看器。打开项目文件夹里的 STL �
 
 1. **选文件夹**：点左侧的文件夹图标，再点 **+** 添加文件夹（用户目录下的任意项目文件夹）。助手也可以调用 `add_model_folder`，或用 `/viewer?root=<文件夹绝对路径>` 打开页面。
 2. **打开模型**：在列表里勾选文件，或让助手调用 `add_model_file`。底部工具条可以切换视角、适配（`F`）、边线、网格和剖切。
-3. **标注**：点 **选点**（`P`），在模型上点击位置，再点 **确认**（`Enter`）。给每个点写备注，并写下想让 AI 做什么。
+3. **标注**：点 **选点**（`P`），在模型上点击位置，再点 **确认**（`Enter`）。标注面板打开后仍在选点模式：给一个点写备注，接着点下一个位置（它会立刻加入列表，光标跳到它的备注框），如此往复；「想让 AI 做什么」随时可以写。点 **完成** 或按 `Esc` 结束选点；之后再点 **选点**，会接着往同一个列表里加。
 4. **发送**：点 **发送到对话**（在说明框里可按 `⌘/Ctrl + Enter`）。
 
 | 快捷键 | 作用 |
 | --- | --- |
 | `P` | 进入 / 退出选点模式 |
-| `Enter` | 确认选中的点 |
-| `Backspace` | 删除最后一个未确认的点 |
-| `Esc` | 依次关闭弹层、退出选点、关闭面板 |
-| `⌘/Ctrl + Z` | 撤销上一次标注改动 |
+| `Enter` | 确认第一批选中的点（之后的点不需要确认） |
+| `Backspace` | 删除这次进入选点模式后最后加的一个点（输入文字时不生效） |
+| `Esc` | 依次离开输入框、关闭弹层、退出选点、关闭面板 |
+| `⌘/Ctrl + Z` | 撤销上一次增删标注（之后写的备注会保留） |
 | `F` | 适配视图 |
 
 ### AI 工具（MCP）
@@ -140,9 +140,9 @@ clear()                                      # 清空推送的模型
 ## 测试环境
 
 - MiniMax Code 桌面版 `3.1.1-preview.4597`（Electron 42），macOS 26（Apple Silicon）；Python 3.9 + CadQuery 2.5.2 / OCP 7.7.2、trimesh 4.12、pyrender 0.1.45。
-- 在 MiniMax Code 中验证（1.1.1）：本机安装；带 `?root=` 打开的页面在新的 Host/Origin 校验下能正常读取和登记文件夹，面板开着时 `list_model_folders` 返回 `viewer_connected: true`。（1.1.0）：本机安装；新开的对话里能看到 `mcp__cq-viewer__add_model_folder`、`mcp__cq-viewer__add_model_file`、`mcp__cq-viewer__list_model_folders` 和 skill `cq-viewer:parametric-3d-printing`；经宿主调用了 `list_model_folders` 和 `add_model_folder`（`select: false`）。1.0.0 时验证过：打开、通过 `?root=` 登记文件夹、宿主桥接探测（这个版本不响应 `ui/initialize` 握手，因此走降级路径）。
+- 在 MiniMax Code 中验证（1.2.0）：本机安装并打开；连续选点本身在无头 Chrome 中验证（见下）。（1.1.1）：本机安装；带 `?root=` 打开的页面在新的 Host/Origin 校验下能正常读取和登记文件夹，面板开着时 `list_model_folders` 返回 `viewer_connected: true`。（1.1.0）：本机安装；新开的对话里能看到 `mcp__cq-viewer__add_model_folder`、`mcp__cq-viewer__add_model_file`、`mcp__cq-viewer__list_model_folders` 和 skill `cq-viewer:parametric-3d-printing`；经宿主调用了 `list_model_folders` 和 `add_model_folder`（`select: false`）。1.0.0 时验证过：打开、通过 `?root=` 登记文件夹、宿主桥接探测（这个版本不响应 `ui/initialize` 握手，因此走降级路径）。
 - `node --test plugins/hanzijie/cq-viewer/tests/*.test.mjs`：共 19 个测试，用临时用户目录跑真实的 Node 入口。`tests/mcp.test.mjs`：三个工具、文件夹规则、带颜色复制到场景、重启后的请求记录、回环与 JSON 检查。`tests/server.test.mjs`：40 个并发保存标注、8 个并发登记文件夹（页面和 MCP 混合）没有报错也没有丢条目；用假 Python 验证转换中 dispose 会结束进程且不启动退回转换、被结束的转换不退回、`SIGSEGV` 崩溃仍会退回；缓存清理；所有路由的 Host/Origin 校验；版本号一致。
-- 在无头 Chrome 中对同一个 Node 入口做了端到端测试：AI 调用工具后页面切换文件夹并打开文件；`copy_to_scene` 复制的零件按指定颜色显示；页面关着时请求的文件在下次打开时出现，之后不会重复执行，用户取消勾选后保持关闭；页面离开后 `viewer_connected` 变为 false。1.0.0 时测过：打开 STL 和 STEP（多层装配，含名称、颜色、复用实例）、自动重新加载、选点 → 确认 → 备注、模拟 MCP Apps 宿主下的 `ui/message` 路径、模拟页面桥接下的降级路径，以及没有宿主时按钮切换为复制。
+- 在无头 Chrome 中对同一个 Node 入口做了端到端测试，分别在 1400 px 和 800 px 宽度下各 19 项：第一批点确认后保持选点模式；正在编辑备注或「想让 AI 做什么」时继续点击，新点直接进入列表，光标跳到新点的备注框，已写的备注不丢；「撤销上一个」/`Backspace` 删除本次最后加的点；`⌘Z` 恢复它并保留期间改过的备注；连按两次 `Esc` 或点「完成」退出选点；再次点「选点」无需确认直接继续；收起的面板在新增点时自动展开；「清空标注」后恢复确认步骤；`selection.json` 中有点、备注和说明；窄屏下面板不遮挡选点栏。1.1.0 时测过：AI 调用工具后页面切换文件夹并打开文件；`copy_to_scene` 复制的零件按指定颜色显示；页面关着时请求的文件在下次打开时出现，之后不会重复执行，用户取消勾选后保持关闭；页面离开后 `viewer_connected` 变为 false。1.0.0 时测过：打开 STL 和 STEP（多层装配，含名称、颜色、复用实例）、自动重新加载、选点 → 确认 → 备注、模拟 MCP Apps 宿主下的 `ui/message` 路径、模拟页面桥接下的降级路径，以及没有宿主时按钮切换为复制。
 - 内置 skill：在已安装的插件目录里运行 `run_cadquery_model.py --preview --strict`（建模 → STL → watertight 校验 → 预览图）。
 - 未验证：Windows；查看器面板开着时经宿主调用 `add_model_file`（页面这一侧只在无头 Chrome 里验证过）；这个版本里发送的降级路径是否真的填进了对话输入框；其他 CAD 软件导出的带面级颜色的 STEP；skill 的 Gridfinity 生成器在 CadQuery 2.5 下的表现（skill 要求 2.6.1 及以上）。
 
