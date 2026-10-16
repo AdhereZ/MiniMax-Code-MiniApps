@@ -100,7 +100,7 @@ The preview uses synthetic data. The app interface is currently in Chinese. See 
 
 ### Requirements
 
-Use a MiniMax Code desktop version that supports MiniApps. Check the app's README for tested client versions, operating systems, configuration, and known limitations. Compatibility is documented per app.
+Use a MiniMax Code desktop version that supports MiniApps. Check the app's README for tested client versions, operating systems, configuration, and known limitations. Compatibility is documented per app. Apps that use newer capabilities, such as running Agent tasks or opening in their own window, need MiniMax Code 3.1.2 or later; older versions cannot install them.
 
 ### 1. Download
 

@@ -31,6 +31,7 @@ Install section explains where that directory is). Restart MiniMax Code and ask 
 package.json                  Mini App declaration
 miniapp/miniapp.json          Payload roots, Node entry, page route
 miniapp/client/index.html     The page served at /dashboard
+miniapp/client/client-api.ts  Type declarations for the page APIs (window.mcode); not loaded at runtime
 miniapp/node/server.mjs       Node entry: start(context) → { dispose }
 miniapp/node/miniapp-api.ts   Type declarations for the runtime context
 icon.png                      Plugin icon

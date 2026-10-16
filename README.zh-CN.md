@@ -101,7 +101,7 @@ MiniMax Code Agent 通过宿主 MCP 客户端与 MiniApp 协作。业务请求�
 
 ### 使用要求
 
-需要支持 MiniApp 的 MiniMax Code 桌面端版本。各作品的 README 会说明已验证的客户端版本、操作系统、所需配置和已知限制，兼容性以具体作品为准。
+需要支持 MiniApp 的 MiniMax Code 桌面端版本。各作品的 README 会说明已验证的客户端版本、操作系统、所需配置和已知限制，兼容性以具体作品为准。使用较新能力（如运行 Agent 任务、在独立窗口中打开）的作品需要 MiniMax Code 3.1.2 或更高版本，旧版本无法安装。
 
 ### 1. 下载
 
