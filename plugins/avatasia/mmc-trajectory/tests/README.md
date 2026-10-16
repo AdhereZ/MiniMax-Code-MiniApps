@@ -208,13 +208,57 @@ with the reason stated rather than quietly dropped.
   guards is gone.
 - **`mutate-qa-lens.py`** — not carried. Guards the 问答 turn-lens. Same removal; no lens symbol
   remains.
-- **`verify-time-range.mjs`** and its control **`mutate-time-range.py`** — present, skipped by
-  `run.mjs`. Its assertions are calibrated against a full multi-generation session:
-  `stats.messages > 1000`, and a checkpoint nested inside a turn rather than being one. The
-  committed fixture is a single-file session of a few dozen rows. Reproducing those numbers
-  faithfully would mean committing a multi-megabyte payload; relaxing them would stop exercising
-  the timezone arithmetic the file exists for. Run it by hand against a booted service:
-  `node tests/verify-time-range.mjs <port>`.
+- **`verify-time-range.mjs`** — used to be here, skipped by `run.mjs`, and is now in the default
+  run. It was skipped for one reason: the only session it could get was whatever a booted service
+  had, while its assertions want `stats.messages > 1000` and a local midnight with rows on both
+  sides of it. The committed fixture is sixty rows of one afternoon. Shipping it anyway would have
+  meant shipping a red suite; relaxing the numbers would have stopped exercising the timezone
+  arithmetic the file exists for; committing a multi-megabyte real transcript would have put a
+  session's contents in the package.
+
+  It now builds its own transcript — 400 turns across four generations of 100, spanning eight hours
+  across a local midnight — and hands the **last three generations** to the server's own
+  `buildTrajectoryPayload`, the same exported function `/api/trajectory` calls. **What is synthetic
+  is the conversation; the `stats` being compared is still computed by the code under test.** That is
+  what makes section 3 still a real comparison: it asks whether the page's re-derivation agrees with
+  the server's numbers, and both sides are the shipped implementations.
+
+  The view is deliberately **not** the whole conversation, and that is what makes one of its numbers
+  testable. `messagesAll` counts the lineage; `messages` counts what this view holds. Hand the server
+  everything and the two are the same number, the 「全程 N」 assertion becomes the page agreeing with
+  itself, and re-scoping that field onto the view changes nothing any assertion can see. The
+  generator therefore keeps a whole generation out of the payload, and asserts the two differ before
+  asserting anything about either.
+
+  The generator is written to make the comparison bite rather than merely pass. It is not enough
+  for the session to be large: the fields section 3 compares have to be **non-zero**, or `0 === 0`
+  is green and means nothing. So the mix is deliberate — prompt turns, continuations, unfinished
+  turns, a turn that asks the reader something, steers, failing tool calls, bare checkpoint turns,
+  and all five token counters. Every compared field is checked non-zero *by the guard*, driven off
+  the same list the comparisons are driven off, so a field added there arrives covered rather than
+  waiting to be discovered at zero.
+
+  Two shapes in it are not obvious and were both wrong on the first attempt:
+
+  - `closed` is **not** a stop reason. The server sets it from a record of kind `reply`, and that
+    kind is assigned from the literal string `stop`. A closing assistant row written as `'endTurn'`
+    projects as `narration`, and every turn in the session silently stays open — `openTurns` came
+    out at 275 of 275, which is the shape that made the comparison look fine while testing nothing.
+  - A turn only closes when a **second** assistant row follows its tool results. One assistant row
+    carrying both text and tool calls is not a reply.
+
+  **It has a mutation control now: `mutate-time-range.py`, 29 cases in three groups.** The first six
+  are the mutations that were previously checked by hand against a throwaway copy of the package
+  while this file sat outside the suite — that was a one-off result nothing re-ran, so a later edit
+  could pass everything else here while this file went unverified. Each must be caught **by name**,
+  via the `FAILED_NAMES` line the guard prints, because a mutation is not satisfied by the suite
+  going red. The second group is one dropped count per compared field: both sides of a comparison are
+  correct in a passing run, so a field nobody mutates is a field whose comparison could be satisfied
+  by a page that never counts it at all. The third group breaks the guard's own session instead of
+  the page's code — removing the checkpoint turns, and making the view the whole conversation again
+  — because otherwise the twenty non-zero assertions are a claim about a generator nobody has tried to
+  starve. A comment-only edit is required to leave every verdict unchanged, the other direction:
+  a guard that cannot pass is as broken as one that cannot fail.
 
 ### Two anchors that were wrong, and one mutation that could not be caught
 

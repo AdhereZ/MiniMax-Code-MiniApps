@@ -146,13 +146,30 @@ const handleRawAt = SERVER.indexOf('const handleRaw = async');
 assert('handleRaw exists', handleRawAt > 0);
 const handleRawBody = SERVER.slice(handleRawAt, SERVER.indexOf('};', handleRawAt));
 assert('it calls buildRawPayload, i.e. it builds rather than looks up a stored message',
-  handleRawBody.includes('buildRawPayload(row.message, redact)'));
-assert('it follows the locator back to a row', handleRawBody.includes('cached.rows[rowIndex]'));
+  handleRawBody.includes('buildRawPayload(found.row.message, redact)'));
+// The read and its digest check were written here until `/api/trajectory/record` needed the same
+// two steps. Two copies is two answers to 「这还是那条记录对应的字节吗」, and the guard could not
+// even tell them apart — a mutation against one of them left the other satisfying the assertion.
+assert('the read and its digest check live in one place both handlers call',
+  /readRecordRow\s*=\s*async/.test(SERVER)
+  && SERVER.includes('readRange(locator.filePath, locator.start, locator.end)')
+  && SERVER.includes('lineDigest(bytes) !== locator.digest')
+  && handleRawBody.includes('readRecordRow(locator)'));
+assert('and neither handler re-reads a line for itself',
+  !handleRawBody.includes('readRange(') && !handleRawBody.includes('lineDigest('));
 assert('it reports the verdict alongside the message', /omitted: built\.omitted/.test(handleRawBody));
 assert('a missing row is still a 404, not an empty message', handleRawBody.includes("'record_not_found'"));
-assert('the cache entry keeps the rows the locators point into',
-  SERVER.includes('raws: Map<number, number>, rows: Array<Record<string, any>>'));
-assert('the cache entry is written with the rows', SERVER.includes('{ at: Date.now(), etag, body, raws, rows }'));
+// The entry shape lives in createTrajectoryCache now, so this asserts the thing the assertions
+// above jointly depend on: the route stores the record->locator map into the entry, and /raw reads
+// `cached.raws` back out of it. It used to store `rows` and read `cached.rows`, which is the thing
+// that was costing 233 MB; anchoring on the JSDoc type comment instead would have made this a
+// check on where a type was written rather than on what the route does.
+// `rowPos` sits next to `raws` in the entry and for the same reason: both say where a record's
+// content lives once the parsed rows are gone, and the position is what lets `/api/trajectory/record`
+// answer for one record of a line that expanded into several.
+assert('the cache entry keeps the locators /raw follows, keyed by record',
+  SERVER.includes('raws, rowPos: rowPosByRecord, decoded: new Map() })')
+  && handleRawBody.includes('cached.raws.get(wanted)'));
 
 /* =====================================================================
  * 4 — each of the five readers, by name
@@ -164,8 +181,8 @@ assert('the cache entry is written with the rows', SERVER.includes('{ at: Date.n
 assert('1 handoff: the line reads the argument, not the record',
   CLIENT.includes("if (rawOmitted) lines.push('- 提示：原文过大已被省略。');"));
 assert('1 handoff: buildHandoffMarkdown takes the verdict',
-  /function buildHandoffMarkdown\(session, turn, record, rawText, rawTruncated, rawOmitted\)/.test(CLIENT));
-assert('1 handoff: the caller passes it', CLIENT.includes('raw.truncated,\n            omitted\n          );'));
+  /function buildHandoffMarkdown\(session, turn, record, rawText, rawTruncated, rawOmitted, errorText\)/.test(CLIENT));
+assert('1 handoff: the caller passes it', CLIENT.includes('raw.truncated,\n            omitted,\n            detail && detail.result ? detail.result : null\n          );'));
 
 assert('2 rawSourceFor: no longer short-circuits on the record',
   /function rawSourceFor\(record\) \{\s*return fetchRaw\(record\);/.test(CLIENT));
@@ -176,7 +193,12 @@ assert('3 raw tab: draws the omitted note from the answer',
 assert('3 raw tab: and the note still says the same thing',
   CLIENT.includes('原文过大，已省略。可以从参数与结果页查看已保留的部分。'));
 
-assert('4 raw tab: an omitted message renders the dash', CLIENT.includes('pre.textContent = DASH;\n            return;'));
+// Anchored on the insertBefore above it. `pre.textContent = DASH;` + `return;` is written twice in
+// the page now — the omitted-message branch and the empty-detail branch — so a pattern loose
+// enough to match either is satisfied by a change to just one of them, which is what a mutation
+// that targets the wrong copy looks like from here.
+assert('4 raw tab: an omitted message renders the dash',
+  CLIENT.includes('              pre\n            );\n            pre.textContent = DASH;\n            return;'));
 assert('5 copySelected: reads the new shape',
   CLIENT.includes('var noRaw = fetched.omitted === true || fetched.raw === null || fetched.raw === undefined;'));
 assert('handoff: reads the new shape', CLIENT.includes('var omitted = fetched.omitted === true;'));

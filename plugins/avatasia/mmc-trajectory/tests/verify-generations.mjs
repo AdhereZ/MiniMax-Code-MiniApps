@@ -11,6 +11,8 @@ import {
   readGenerationMarker,
   walkLineage,
   ROW_GENERATION,
+  buildMessageIdentity,
+  selectIdentityView,
 } from '../miniapp/node/server.mjs';
 
 let pass = 0;
@@ -148,7 +150,11 @@ const payload = buildTrajectoryPayload({
   generation: 2,
 });
 check('messages counts this generation only', payload.stats.messages, 2);
-check('messagesAll spans every generation', payload.stats.messagesAll, 676 + 548 + 186);
+// What it used to assert — the session-wide number must not shrink to one generation — is now
+// carried by the identity path below, where it is actually true. What it asserts here is the
+// definition: logical messages, not the rows the catalog recorded per file.
+check('messagesAll counts logical messages, not catalog rows', payload.stats.messagesAll, 2);
+check('...and the physical row count is reported separately', payload.stats.messageRowsAll, 2);
 check('compactions counted', payload.stats.compactions, 1);
 check('generation echoed on the session', payload.session.generation, 2);
 check('generation list passed through', payload.session.generations.length, 3);
@@ -243,6 +249,62 @@ check('no orphans on a clean chain', full.orphans, []);
 const single = await walkLineage(fixtureCatalog([[0,'messages.jsonl']]), probeFrom({ ...FILES, gen1: 'g1.jsonl', 'messages.jsonl': plainRow }));
 check('an uncompacted session is one generation', single.chain.map((l) => l.generation), [0]);
 
+/* An active file that opens with no marker. The marker rides on the checkpoint row that rotated
+   the generation, so a session whose active file was rewritten in place has none — and reading
+   nothing off its head used to start the walk at generation 0, which reached no parent and
+   turned every sealed generation it actually had into an orphan. Measured over the store: one
+   session in 139, and it is the only one the runtime ever rewrote tool results in. */
+{
+  const noMarker = await walkLineage(
+    fixtureCatalog([[0,'g0.jsonl'],[1,'g1.jsonl'],[2,'messages.jsonl']]),
+    probeFrom({ ...FILES, gen0: 'g0.jsonl', gen1: 'g1.jsonl', 'messages.jsonl': plainRow }),
+  );
+  check('an active file with no marker still starts at the generation the catalog names',
+    noMarker.chain.map((l) => l.generation), [0, 1, 2]);
+  check('...so its sealed generations are reached, not orphaned', noMarker.orphans, []);
+
+  // The shape the store actually has: a session that compacted once and whose files declare
+  // nothing at all, because the marker rides on a checkpoint row that is not there. Both the
+  // active file and its one sealed snapshot are marker-less, and the snapshot is reached at
+  // generation 1 — where reading "no marker" as generation 0 used to refuse it.
+  const noMarkersAtAll = await walkLineage(
+    fixtureCatalog([[1,'g1.jsonl'],[2,'messages.jsonl']]),
+    probeFrom({ 'g1.jsonl': plainRow, gen1: 'g1.jsonl', 'messages.jsonl': plainRow }),
+  );
+  check('a sealed snapshot reached at a generation it does not declare is still stitched',
+    noMarkersAtAll.chain.map((l) => l.generation), [1, 2]);
+  check('...and nothing is left as an orphan', noMarkersAtAll.orphans, []);
+
+  // The counter-example, and the reason this is a fallback rather than a new source of truth: a
+  // file that DOES declare its generation still overrides the catalog, so this cannot become a
+  // way for a hand-edited catalog to place a file in a lineage.
+  const lying = await walkLineage(
+    fixtureCatalog([[0,'g0.jsonl'],[1,'g1.jsonl'],[2,'messages.jsonl']]),
+    probeFrom({ ...FILES, gen0: 'g0.jsonl', gen1: 'g1.jsonl', 'messages.jsonl': markerRow(7, 6) }),
+  );
+  check('a file that declares its own generation still wins over the catalog',
+    lying.chain.map((l) => l.generation), [7]);
+  check('...and everything the walk cannot reach stays orphaned', lying.orphans.map((o) => o.generation), [0, 1]);
+
+  // And the fork case is unchanged: a sealed file that names a generation other than the one it
+  // was reached for is still refused, marker or no marker.
+  const forkedOnPurpose = await walkLineage(
+    fixtureCatalog([[0,'g0.jsonl'],[1,'g1.jsonl'],[2,'messages.jsonl']]),
+    probeFrom({ ...FILES, gen0: 'g0.jsonl', gen1: 'g1.jsonl', 'g1.jsonl': markerRow(7, 6), 'messages.jsonl': markerRow(2, 1) + plainRow }),
+  );
+  check('a sealed file declaring the wrong generation is still refused',
+    forkedOnPurpose.chain.map((l) => l.generation), [2]);
+  check('...and is reported as an orphan', forkedOnPurpose.orphans.map((o) => o.generation), [0, 1]);
+
+  // A catalog that names no active entry at all leaves nothing to fall back to, and the walk
+  // still starts rather than throwing.
+  const nameless = await walkLineage(
+    { generations: [{ generation: 4, kind: 'snapshot', fileName: 'g0.jsonl', byteLength: 1, messageCount: 1, revision: null, active: false }] },
+    probeFrom({ 'g0.jsonl': plainRow, 'messages.jsonl': plainRow }),
+  );
+  assert('a catalog with no active entry still yields a chain', nameless.chain.length >= 1);
+}
+
 /* a snapshot whose parent generation is not exactly one lower is not part of this lineage */
 const skipped = await walkLineage(fixtureCatalog([[0,'g0.jsonl'],[1,'g1.jsonl'],[2,'messages.jsonl']]), probeFrom({
   ...FILES, gen0: 'g0.jsonl', gen1: 'g1.jsonl',
@@ -288,12 +350,75 @@ const stitchedPayload = buildTrajectoryPayload({
   orphans: [{ generation: 5, fileName: 'orphan.jsonl' }],
 });
 const allRecords = stitchedPayload.turns.flatMap((t) => t.records);
+const generationsLogical = (payload) => payload.session.generations
+  .slice()
+  .sort((a, b) => a.generation - b.generation)
+  .map((g) => g.logicalMessageCount);
 check('every record carries a generation', allRecords.every((r) => Number.isInteger(r.generation)), true);
 check('generations appear in stitch order', [...new Set(allRecords.map((r) => r.generation))], [0, 1, 2]);
 check('the symbol never reaches the body', JSON.stringify(stitchedPayload).includes('rowGeneration'), false);
 check('orphans are reported on the session', stitchedPayload.session.orphans.map((o) => o.generation), [5]);
-check('the fixture catalog counts match the stitched rows', stitchedPayload.stats.messagesAll, 30);
-check('a stitched view still reports the session-wide total', stitchedPayload.stats.messagesAll >= stitchedPayload.stats.messages, true);
+// Five stored rows, three of them the same `msg-a1` re-recorded in each generation. The catalog
+// claims thirty; the conversation has three.
+check('the stitched rows collapse into logical messages, not stored rows', stitchedPayload.stats.messagesAll, 3);
+check('the physical row count stays available separately', stitchedPayload.stats.messageRowsAll, 5);
+
+/* The session-wide number has to survive being read one generation at a time, which is the
+   property the catalog sum used to supply. The route builds the identity table over the whole
+   lineage and projects afterwards, so the slice carries the lineage's count with it. */
+const stitchedIdentity = buildMessageIdentity(stitched.map((row) => ({
+  row,
+  generation: /** @type {number} */ (row[ROW_GENERATION]),
+  locator: null,
+})));
+check('the identity table merges the three copies of one message', stitchedIdentity.stats.identities, 3);
+const slice = selectIdentityView(stitchedIdentity, 1);
+const slicePayload = buildTrajectoryPayload({
+  session: { id: 'mvs_9s', createdAtMs: 1 },
+  rows: slice.rows,
+  generations: fixtureCatalog([[0,'g0.jsonl'],[1,'g1.jsonl'],[2,'messages.jsonl']]).generations,
+  identity: stitchedIdentity,
+  openerByTurn: slice.openerByTurn,
+});
+check('a single-generation slice shows only that generation', slicePayload.stats.messages, 2);
+check('...while still reporting the whole conversation', slicePayload.stats.messagesAll, 3);
+// Per-generation counts overlap by construction: msg-a1 is stored in all three.
+check('each generation reports the messages IT stores', generationsLogical(stitchedPayload), [1, 2, 2]);
+
+/* ---- a steer whose opener is stored in an earlier generation ----
+   Deciding the opener from the projected slice is what made this prompt look like the first
+   prompt of its own turn, which counted it as a conversation instead of a redirect and dropped
+   the turn out of the 对话 total while the reader was looking straight at it. */
+const crossGen = [
+  { row: { message_id: 'c-1', turn_id: 'tx', message: { role: 'user', content: [{ type: 'text', text: 'start it' }], timestamp: 10 } }, generation: 0, locator: null },
+  { row: { message_id: 'c-2', turn_id: 'tx', message: { role: 'assistant', content: [{ type: 'text', text: 'on it' }], timestamp: 11 } }, generation: 0, locator: null },
+  { row: { message_id: 'c-3', turn_id: 'tx', message: { role: 'user', content: [{ type: 'text', text: 'no, the other one' }], timestamp: 20 } }, generation: 1, locator: null },
+];
+const crossIdentity = buildMessageIdentity(crossGen);
+check('the opener is the first prompt of the turn, from generation 0', crossIdentity.openers.get('tx'), 'c-1');
+const crossSlice = selectIdentityView(crossIdentity, 1);
+const crossPayload = buildTrajectoryPayload({
+  session: { id: 'mvs_x', createdAtMs: 10 },
+  rows: crossSlice.rows,
+  identity: crossIdentity,
+  openerByTurn: crossSlice.openerByTurn,
+});
+const crossKinds = crossPayload.turns.flatMap((t) => t.records).map((r) => r.kind);
+check('the prompt alone in the slice is still a steer', crossKinds, ['steer']);
+check('...so it is not counted as a conversation prompt', [crossPayload.stats.userMessages, crossPayload.stats.steers], [0, 1]);
+check('...and the turn is still a prompted turn', [crossPayload.stats.turnsWithPrompt, crossPayload.turns[0].turnClass], [1, 'prompt']);
+check('...and it says the opener is elsewhere', [crossPayload.turns[0].openerInView, crossPayload.turns[0].openerOutOfView], [false, true]);
+
+const crossWhole = selectIdentityView(crossIdentity, null);
+const crossWholePayload = buildTrajectoryPayload({
+  session: { id: 'mvs_x', createdAtMs: 10 },
+  rows: crossWhole.rows,
+  identity: crossIdentity,
+  openerByTurn: crossWhole.openerByTurn,
+});
+check('the whole lineage files the opener as dialogue and the rest as a steer',
+  crossWholePayload.turns.flatMap((t) => t.records).map((r) => r.kind), ['user', 'narration', 'steer']);
+check('...and both are inside the view', [crossWholePayload.turns[0].openerInView, crossWholePayload.turns[0].openerOutOfView], [true, false]);
 
 /* ---- a turn total is only readable if it says what it is made of ---- */
 const turnRows = [];

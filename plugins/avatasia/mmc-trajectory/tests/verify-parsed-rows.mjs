@@ -13,6 +13,12 @@
  * through the cache — build the payload both ways, and require the serialized bodies to be
  * identical. Not "looks the same", identical.
  *
+ * What the cache now covers is narrower than it was: only sealed generations are retained, because
+ * for the file being appended to the key cannot hit by construction. That narrower job is pinned in
+ * tests/verify-raw-locators.mjs, along with what replaced the rows for `/raw`. What is left here is
+ * the cache's own correctness — that a hit is identical to a cold read, that its key names
+ * everything it must name, and that it cannot serve one session's rows to another.
+ *
  * The key's three components are each tested by the failure they exist to prevent:
  * a path, because every session has a `messages.jsonl` and a basename key lets two of them
  * collide; a size, because the active file grows; a limit, because readHead truncates at it.
@@ -75,7 +81,11 @@ const jsonl = [
 // 6 parseable rows, 2 skipped (one unparseable, one not an object). Counted by hand.
 const EXPECTED_SKIPPED = 2;
 
-const other = { session: { id: 'sess-b', createdAtMs: 1791617886000 }, sizeBytes: 0, truncated: false };
+// A stand-in session, so a key built for one conversation cannot be served another's. It carries a
+// session and nothing else: `sizeBytes` and `truncated` are spread BELOW this, so any value added
+// here would silently replace what the loop just computed — and the body-equality comparison would
+// then be asserting a constant instead of what was actually read.
+const other = { session: { id: 'sess-b', createdAtMs: 1791617886000 } };
 
 /** Build the body the way the route does, from a set of per-file results. */
 async function buildBody(files, filter) {
@@ -318,9 +328,11 @@ assert('the cache is created inside start(), not at module level',
   && !/\nconst parsedRows = createParsedRowsCache\(/.test(SERVER.slice(0, startAt)));
 
 assert('the route reaches the file through loadParsedRows()',
-  startBody.includes('await loadParsedRows(parsedRows, filePath, limit)'));
+  startBody.includes('await loadParsedRows(parsedRows, filePath, limit, { cacheable: link.fileName !== activeFileName })'));
 assert('the route no longer parses messages inline',
   !startBody.includes('parseMessagesJsonl(head.text)'));
+assert('the bytes readHead returns are what gets parsed, not a decoded string',
+  SERVER.includes('parseMessagesJsonl(head.buffer)'));
 assert('the key is built from a stat of the file, not from the catalog',
   /const current = await stat\(filePath\);/.test(SERVER)
   && !/parsedRowsKey\(filePath, entry\.sizeBytes/.test(SERVER)

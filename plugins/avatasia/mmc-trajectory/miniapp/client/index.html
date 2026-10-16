@@ -25,8 +25,6 @@
         --mcode-success: #04b54b;
         --mcode-warning: #f56811;
         --mcode-danger: #f73646;
-        --mcode-primary-action-bg: #171717;
-        --mcode-primary-action-text: #ffffff;
       }
 
       :root[data-theme='dark'] {
@@ -44,8 +42,6 @@
         --mcode-success: #009c3d;
         --mcode-warning: #e25507;
         --mcode-danger: #e31937;
-        --mcode-primary-action-bg: #ffffff;
-        --mcode-primary-action-text: #171717;
       }
 
       /* Fallback when the script has not set data-theme yet. */
@@ -65,8 +61,6 @@
           --mcode-success: #009c3d;
           --mcode-warning: #e25507;
           --mcode-danger: #e31937;
-          --mcode-primary-action-bg: #ffffff;
-          --mcode-primary-action-text: #171717;
         }
       }
 
@@ -251,30 +245,6 @@
         background: var(--mcode-surface-muted);
       }
 
-      .btn-primary {
-        background: var(--mcode-primary-action-bg);
-        color: var(--mcode-primary-action-text);
-        border-color: transparent;
-      }
-
-      .btn-primary:hover:not(:disabled) {
-        background: var(--mcode-primary-action-bg);
-        border-color: transparent;
-        opacity: 0.86;
-      }
-
-      .btn-text {
-        background: transparent;
-        border-color: transparent;
-        color: var(--mcode-accent);
-        padding: 0 8px;
-      }
-
-      .btn-text:hover:not(:disabled) {
-        background: var(--mcode-surface-muted);
-        border-color: transparent;
-      }
-
       .btn[aria-pressed='true'] {
         background: var(--mcode-surface-muted);
         border-color: var(--mcode-accent);
@@ -350,10 +320,6 @@
 
       .bar-warning {
         border-left-color: var(--mcode-warning);
-      }
-
-      .bar-success {
-        border-left-color: var(--mcode-success);
       }
 
       .bar-title {
@@ -585,83 +551,6 @@
          invalid state is also a word. */
       .range-hint.is-invalid {
         color: var(--mcode-danger);
-      }
-
-      .chipbar {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .chips {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-        margin: 0;
-        padding: 0;
-        border: 0;
-        min-width: 0;
-      }
-
-      .legend {
-        float: none;
-        padding: 0 4px 0 0;
-        font-size: 12px;
-        color: var(--mcode-text-muted);
-      }
-
-      .chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        min-height: 28px;
-        padding: 0 10px;
-        border: 1px solid var(--mcode-border);
-        border-radius: 999px;
-        background: var(--mcode-surface);
-        color: var(--mcode-text-muted);
-        font: inherit;
-        font-size: 12px;
-        line-height: 1;
-        cursor: pointer;
-        transition: background-color 150ms ease-out, border-color 150ms ease-out, color 150ms ease-out;
-      }
-
-      .chip:hover {
-        background: var(--mcode-surface-muted);
-        border-color: var(--mcode-border-strong);
-      }
-
-      .chip input {
-        position: absolute;
-        opacity: 0;
-        width: 1px;
-        height: 1px;
-        margin: 0;
-        pointer-events: none;
-      }
-
-      .chip-mark {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: currentColor;
-        flex: none;
-      }
-
-      .chip[aria-pressed='true'],
-      .chip.is-on {
-        background: var(--mcode-surface-muted);
-        border-color: var(--mcode-border-strong);
-        color: var(--mcode-text);
-        font-weight: 500;
-      }
-
-      .chip:focus-within {
-        outline: 2px solid var(--mcode-accent);
-        outline-offset: 2px;
       }
 
       /* ---------------- KPI strip ---------------- */
@@ -1136,7 +1025,7 @@
         left: calc(var(--ov-left) + var(--ov-gap));
         width: max(2px, calc(var(--ov-width) - var(--ov-gap) - var(--ov-gap)));
         height: 8px;
-        min-width: 2px;
+        min-width: var(--ov-min, 2px);
         border-radius: 1px;
         background: var(--mcode-text-subtle);
         opacity: 0.78;
@@ -1585,14 +1474,6 @@
         font-size: 12px;
         color: var(--mcode-text-muted);
         min-width: 0;
-      }
-
-      .turn-meta .num {
-        font-variant-numeric: tabular-nums;
-      }
-
-      .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
 
       /* Width of the 记录序号 column, shared by `.row`, `.compaction-band` and
@@ -2950,8 +2831,11 @@
           // instead of one. 无答复 cannot see it either way: an empty reply closes its turn, so
           // `closed` is true and that rule has nothing to fire on. Measured on this session:
           // two, one of them the turn that ended in front of the reader with nothing shown.
+          // `hasText` is the server's own verdict, measured from the text it projected, and it is
+          // NOT the same question as whether `summary` is empty: a body-less reply is given its
+          // title as a summary, so reading one from the other would find nothing to flag.
           record: function (record) {
-            return !!record && record.kind === 'reply' && isNil(record.text);
+            return !!record && record.kind === 'reply' && record.hasText === false;
           }
         },
         {
@@ -3067,6 +2951,27 @@
         return typeof value === 'number' && isFinite(value);
       }
 
+      /**
+       * The key that identifies ONE row.
+       *
+       * `record.id` is the message's id, and one message can expand into several rows — a
+       * thought, a sentence and six tool calls all share it. So it answers "which message", and
+       * using it as a row key collapses those rows onto one entry: the scroll anchor lands back
+       * on the first of them, and the overview resolves a hover or a time brush against the last.
+       * `record.index` is dense from 1 and already the public `/raw?index=` key, so it is the one
+       * that says "which row".
+       *
+       * Selection is the exception and stays on `record.id` on purpose — picking a row highlights
+       * the whole message it belongs to, and that grouping is the feature.
+       *
+       * @param {{ id?: any, index?: any }} record
+       * @returns {string}
+       */
+      function recordKey(record) {
+        if (record && isCount(record.index)) return String(record.index);
+        return record && record.id ? String(record.id) : '';
+      }
+
       // The runtime rotates a compacted session into generations: the previous messages.jsonl
       // becomes a snapshot and a fresh active file takes its place. A session can therefore
       // hold more than one generation, and the ledger can be narrowed to any one of them.
@@ -3080,12 +2985,16 @@
           .map(function (entry) {
             var active = entry.generation === activeGeneration || entry.active === true;
             var label = '第 ' + formatInt(entry.generation) + ' 代';
+            // The count is how many logical messages THAT generation stores, which is not the
+            // catalog's per-file row count: one message recorded twice is one message, and a
+            // message sealed in an earlier generation and re-recorded here counts in both.
+            var stored = isCount(entry.logicalMessageCount) ? entry.logicalMessageCount : null;
             if (active) label += '（当前）';
-            else if (isCount(entry.messageCount)) label += '（' + formatInt(entry.messageCount) + ' 条）';
+            else if (isCount(stored)) label += '（' + formatInt(stored) + ' 条）';
             return {
               generation: entry.generation,
               active: active,
-              messageCount: isCount(entry.messageCount) ? entry.messageCount : null,
+              messageCount: stored,
               label: label
             };
           });
@@ -3099,15 +3008,6 @@
         var digits = String(Math.abs(Math.trunc(value)));
         var grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
         return (negative ? '-' : '') + grouped;
-      }
-
-      /** Compact form for dense metadata rows. Null never becomes 0. */
-      function formatCompact(value) {
-        if (!isCount(value)) return DASH;
-        var abs = Math.abs(value);
-        if (abs >= 1000000) return trimZeros((value / 1000000).toFixed(1)) + 'M';
-        if (abs >= 10000) return trimZeros((value / 1000).toFixed(1)) + 'k';
-        return formatInt(value);
       }
 
       function trimZeros(text) {
@@ -3391,23 +3291,70 @@
         );
       }
 
-      /** Record fields the search box scans, flattened to one lowercase string. */
-      function recordSearchText(record) {
-        if (!record || typeof record !== 'object') return '';
-        var thinking = record.thinking;
-        var thinkingText =
-          thinking && typeof thinking === 'object' ? safeText(thinking.text !== undefined ? thinking.text : thinking) : safeText(thinking);
-        return [record.summary, record.text, safeText(record.result), thinkingText, record.toolName]
-          .map(function (part) {
-            return safeText(part);
-          })
-          .join('\n')
-          .toLowerCase();
+      /**
+       * The record indexes a search answered with, as a set the filter can ask in constant time.
+       *
+       * `null` is the answer "this page has no search result in force", which is NOT the same as an
+       * empty set: an empty set means the needle matched nothing, and a page that rendered them the
+       * same way would show a full table in one case and a blank one in the other with nothing on
+       * screen to say which had happened.
+       *
+       * @param {Array<{index: number}> | null} hits
+       * @returns {Set<number> | null}
+       */
+      function searchHitSet(hits) {
+        if (!Array.isArray(hits)) return null;
+        var set = new Set();
+        for (var i = 0; i < hits.length; i += 1) {
+          var entry = hits[i];
+          var index = entry && typeof entry.index === 'number' ? entry.index : NaN;
+          if (Number.isInteger(index)) set.add(index);
+        }
+        return set;
       }
 
-      function matchesQuery(record, needle) {
+      /**
+       * Whether a record survives the text filter.
+       *
+       * The needle is no longer scanned here. It used to be, over the record's own summary, text,
+       * result, thinking and tool name — which is the whole bulk of the payload, and searching the
+       * page meant the page had to be holding the bulk. The server answers which records match, from
+       * the same projection this payload was built from, so the page asks a set.
+       *
+       * `hitSet === null` means the needle has not been answered yet. The record passes, and the
+       * count line says 正在搜索 — an unapplied filter that says so beats an applied one that lies.
+       *
+       * @param {any} record
+       * @param {string} needle
+       * @param {Set<number> | null} hitSet
+       */
+      function matchesQuery(record, needle, hitSet) {
         if (!needle) return true;
-        return recordSearchText(record).indexOf(String(needle).toLowerCase()) >= 0;
+        if (hitSet === null || hitSet === undefined) return true;
+        return !!(record && hitSet.has(record.index));
+      }
+
+      /**
+       * What the text filter is doing, in the one place that can say it.
+       *
+       * Four states, and the reason there are four rather than two is that the answer now comes
+       * from somewhere else. 「没搜到」 and 「没搜成」 used to be the same table — an empty one — and
+       * they are not the same thing: one is the server saying there is no such record, the other is
+       * the page not knowing yet. A needle answered with nothing reads as 「未找到」, a needle still
+       * out reads as 「搜索中」, and a needle that failed says so rather than showing an empty table
+       * that reads as an answer.
+       *
+       * Takes the state as an argument so the four can be tested without a page.
+       *
+       * @param {any} searchState
+       */
+      function searchStatusLabel(searchState) {
+        if (!searchState || !searchState.query) return '';
+        if (searchState.searchError) return '搜索失败，以下为上次结果';
+        if (searchState.searchPending) return '搜索中';
+        if (searchState.searchHits !== null && searchState.searchTotal === 0) return '未找到';
+        if (searchState.searchTruncated) return '命中 ' + formatInt(searchState.searchTotal) + ' 条（已截断）';
+        return '命中 ' + formatInt(searchState.searchTotal) + ' 条';
       }
 
       function hasKind(record, kinds) {
@@ -3464,7 +3411,7 @@
         return { text: text.slice(0, cap), truncated: true };
       }
 
-      function buildHandoffMarkdown(session, turn, record, rawText, rawTruncated, rawOmitted) {
+      function buildHandoffMarkdown(session, turn, record, rawText, rawTruncated, rawOmitted, errorText) {
         var lines = [];
         lines.push('请分析这条会话轨迹记录，说明它在做什么、有没有问题，以及是否需要改进。');
         lines.push('');
@@ -3498,9 +3445,12 @@
         if (record.stopReason) lines.push('- 结束原因：' + record.stopReason);
         if (record.textTruncated) lines.push('- 提示：正文已被上游截断。');
         if (rawOmitted) lines.push('- 提示：原文过大已被省略。');
-        if (record.isError || record.error) {
+        // The message behind a failure is the tool result, which no longer rides along on the row.
+        // `errorText` is null when the read did not arrive, and that is said rather than printed as
+        // an empty value: a report that says 「失败」 with nothing after it reads as "no message".
+        if (record.isError === true) {
           lines.push('- 状态：失败');
-          lines.push('- 错误：' + safeText(record.error));
+          lines.push('- 错误：' + (errorText ? safeText(errorText) : '（错误信息未能读取）'));
         } else {
           lines.push('- 状态：已完成');
         }
@@ -3658,7 +3608,15 @@
 
       /* ---------------- state ---------------- */
 
-      var POLL_INTERVAL = 2500;
+      // Two cadences, one per fetch, because the two are not the same work. See startPolling().
+      //
+      // 2500 for the list, which is a cached walk and a cached title read and now usually a 304 —
+      // and which the picker renders 「刚刚」 against. 8000 for the trajectory, which reparses a
+      // lineage and reopens the runtime database on every request. The list wakes the trajectory
+      // early when it has evidence, so the slow tick is a floor on latency, not a replacement for
+      // noticing a change.
+      var SESSION_POLL_INTERVAL = 2500;
+      var TRAJECTORY_POLL_INTERVAL = 8000;
       var PAGE_STEP = 200;
       var SEARCH_DEBOUNCE = 200;
       // Which window the page opens on, and which every reset returns to. A constant rather
@@ -3674,14 +3632,18 @@
       var state = {
         sessions: [],
         sessionsLoaded: false,
-        sessionsError: false,
         followLatest: true,
-        sessionId: null,
+        // Seeded from the host id so the picker and the content agree. `sessionParam()` already
+        // prefers `hostSessionId`, so a host-pinned page used to render 「跟随最新（自动切换）」
+        // above content pinned to a different conversation that it would never switch away from.
+        // That contradiction predates the server-side reachability fix, but the fix turns it from
+        // a visible error into a silent lie, so the seed belongs with it. `renderSessionSelect`
+        // already inserts 「当前会话（不在最近列表）」 for a pinned id the recent list omits.
+        sessionId: detectHostSessionId(),
         payload: null,
         signature: '',
         loading: true,
         hardError: null,
-        stale: false,
         selectedId: null,
         // Disclosure state for the two blocks that are read once and then only take
         // up room. Folding them hands the height back to the ledger.
@@ -3739,6 +3701,21 @@
           last: null
         },
         query: '',
+        // Which records the last ANSWERED search matched, as a set. `null` is "no answer in force",
+        // which is different from an empty set and is never rendered as one — see searchHitSet.
+        searchHits: null,
+        // Whether a search is in flight. The table keeps showing the previous answer meanwhile,
+        // because a filter that empties and refills on every keystroke is worse than one that lags
+        // visibly; `searchPending` is what makes the lag visible.
+        searchPending: false,
+        // What the server said, as distinct from what the page can count. `total` is every match,
+        // `truncated` says the response carried only the first N of them — so the count line can
+        // report a number that is not the number of rows on screen.
+        searchTotal: 0,
+        searchTruncated: false,
+        // Why the last search could not be answered, or null. 「没搜到」 and 「没搜成」 are
+        // different states and the count line has to be able to tell them apart.
+        searchError: null,
         // Time range, in milliseconds since the session started — the same zero the ledger's
         // `+893 分 21 秒` column counts from. `null` on either side means that end is open,
         // and both null is the default: no range, whole session.
@@ -3782,6 +3759,11 @@
         // unchanged session costs a 304 with no body instead of a multi-megabyte reply.
         etag: '',
         etagFor: '',
+        // The same pair for the session list, and separate for the same reason: a validator
+        // means nothing against a different request, and the list's request is a limit. Written
+        // in exactly one place — fetchSessions — the way `etag` is written only in fetchTrajectory.
+        sessionsEtag: '',
+        sessionsEtagFor: '',
         // Cursor for `?since=`: the highest record index already on screen, so a poll that
         // finds new records transfers the tail instead of the session. Bound to a cache key
         // for the same reason the validator is — a cursor means nothing against a different
@@ -3794,11 +3776,99 @@
         generation: null
       };
 
+      /**
+       * 新鲜度：这一层（文档位置 2，`#error-bar` / `#stale-bar`，回答「出错了吗」）的全部状态。
+       *
+       * 它顶掉了两个散落的布尔，都是有理由的。
+       *
+       * `state.stale` 有三个写点，其中「恢复」那一个写在 `applyPayload` 里 —— 而 304 那条路
+       * 不经过 `applyPayload`。于是「恢复」被定义成了「收到一个 body」，而一个安静会话的每一次
+       * 轮询都是 304：cacheKey 只由 `dir|sizeBytes|lastActiveAt` 决定，没动就是同一个 tag，
+       * 服务端必然回 304。所以一次瞬时的连接抖动之后，横幅可以永久停留，而它自己写着
+       * 「正在重试」。
+       *
+       * `state.sessionsError` 更干脆：写了三处、读了零处，会话列表读取失败对读者完全不可见。
+       *
+       * 两个来源是**并列**的信号，不是互斥的：轨迹好了不能掩盖列表还在失败。谁更严重谁说话，
+       * 所以不需要 `resetBaseFilters` 那种跨函数协调。
+       *
+       * 每个字段有且只有一个写者（`noteFresh`），这同时修掉「一个字段一个写者」这条规矩原本被
+       * 打破的地方 —— `state.stale` 有三个写点，而其中两个根本不是它的。
+       */
+      var freshness = {
+        trajectory: { streak: 0, reason: '' },
+        sessions: { streak: 0, reason: '' }
+      };
+
+      /**
+       * The one writer for this layer, and it reports whether the bar's state actually moved.
+       *
+       * That return value is load-bearing rather than a convenience: `render()` rebuilds the
+       * whole ledger, and a quiet session revalidates into a 304 every 8 seconds, so a fix that
+       * re-rendered on every 304 would trade a sticky banner for a permanent rebuild.
+       *
+       * @param {'trajectory'|'sessions'} source
+       * @param {boolean} ok
+       * @param {string} [reason]
+       * @returns {boolean} whether the bar's contents would differ afterwards
+       */
+      function noteFresh(source, ok, reason) {
+        var slot = freshness[source];
+        if (!slot) return false;
+        // A failure always moves: the streak it writes is the count the reader sees. A success
+        // only moves if there was something to clear.
+        var moved = ok ? slot.streak !== 0 : true;
+        if (ok) {
+          slot.streak = 0;
+          slot.reason = '';
+        } else {
+          slot.streak += 1;
+          slot.reason = reason || 'offline';
+        }
+        return moved;
+      }
+
+      /**
+       * 失败分成两类，因为读者的下一步不一样：根本没连上，和连上了但回的东西读不懂。
+       *
+       * 原来这两类加上四种结构化错误码全部塌缩成同一句「更新失败」，页面既不留计数也不打
+       * 日志，于是「抖了一下」和「一直不通」事后无法区分。
+       */
+      function freshnessReason(error) {
+        var code = error && error.code ? String(error.code) : '';
+        if (code === 'session_not_found' || code === 'not_found') return 'session_gone';
+        if (code === 'trajectory_unavailable') return 'store_unavailable';
+        if (code === 'trajectory_unreadable') return 'unreadable';
+        // A status means the server answered and the answer was not usable. No status means the
+        // request itself failed — a different thing to go and look at.
+        if (error && typeof error.status === 'number') return 'bad_response';
+        return 'offline';
+      }
+
+      /** 连续失败时读者才需要知道次数：第一次是抖动，不必加一句解释。 */
+      var FRESH_STREAK_SHOWN = 2;
+
+      var FRESH_TITLES = {
+        session_gone: '该会话已不可用，正在重试',
+        store_unavailable: '本地会话数据目录暂时不可用，正在重试',
+        unreadable: '会话数据暂时无法读取，正在重试',
+        bad_response: '服务端返回了无法读取的内容，正在重试',
+        offline: '与本地服务的连接中断，正在重试'
+      };
+
+      var FRESH_SOURCE_LABELS = { trajectory: '轨迹', sessions: '会话列表' };
+
       var dom = {};
       var inflight = null;
       var sessionsInflight = null;
-      var pollTimer = null;
+      var sessionPollTimer = null;
+      var trajectoryPollTimer = null;
       var searchTimer = null;
+      // The in-flight search and the sequence that decides which of several is allowed to answer.
+      // Both are needed only because the answer comes from somewhere else now: when the page
+      // scanned its own records there was nothing to wait for and nothing to arrive out of order.
+      var searchController = null;
+      var searchSeq = 0;
       var rangeTimer = null;
       var refreshSeq = 0;
 
@@ -3902,27 +3972,85 @@
         return state.followLatest || !state.sessionId ? 'latest' : encodeURIComponent(state.sessionId);
       }
 
-      function fetchSessions() {
+      /**
+       * The session list, on its own validator.
+       *
+       * `manual` is the refresh button asking for the truth, and it drops the validator the way
+       * `fetchTrajectory(manual)` does — a refresh that revalidated the list would be a refresh
+       * of half the page. Every other caller passes nothing.
+       *
+       * Resolves to whether the list actually changed, and that is the part other code reads: a
+       * 200 means something in the visible slice moved, which is the cheap evidence the slow
+       * trajectory tick is waiting for; a 304 means nothing on screen can be stale.
+       *
+       * @param {boolean} [manual]
+       * @returns {Promise<boolean>}
+       */
+      function fetchSessions(manual) {
         if (sessionsInflight) sessionsInflight.abort();
         var controller = new AbortController();
         sessionsInflight = controller;
-        var query = '?limit=20';
-        return fetch('/api/sessions' + query, { signal: controller.signal, headers: { Accept: 'application/json' } })
+        var key = 'limit=20';
+        var query = '?' + key;
+        var headers = { Accept: 'application/json' };
+        if (manual) {
+          state.sessionsEtag = '';
+          state.sessionsEtagFor = '';
+        } else if (state.sessionsEtag && state.sessionsEtagFor === key) {
+          headers['If-None-Match'] = state.sessionsEtag;
+        }
+        return fetch('/api/sessions' + query, { signal: controller.signal, headers: headers })
           .then(function (response) {
-            if (!response.ok) throw new Error('http');
-            return response.json();
+            // Nothing moved since the copy already on screen. Keep every piece of state and
+            // re-render nothing: the picker, its 「刚刚」 labels and its counts are all still true.
+            if (response.status === 304) {
+              var fresh = response.headers.get('etag');
+              if (fresh) state.sessionsEtag = fresh;
+              state.sessionsEtagFor = key;
+              return { changed: false, body: null, etag: state.sessionsEtag };
+            }
+            if (!response.ok) {
+              // The status is what tells a dropped connection apart from a server that answered
+              // with something unusable, and this path used to throw it away.
+              var httpError = new Error('http');
+              httpError.status = response.status;
+              throw httpError;
+            }
+
+            return response
+              .json()
+              .catch(function () { return null; })
+              .then(function (body) {
+                if (!body || typeof body !== 'object') throw new Error('api');
+                return { changed: true, body: body, etag: response.headers.get('etag') || '' };
+              });
           })
-          .then(function (data) {
+          .then(function (result) {
             sessionsInflight = null;
-            state.sessions = data && Array.isArray(data.sessions) ? data.sessions : [];
+            // One writer for the list's validator, on the one path that carried a body.
+            state.sessionsEtag = result.etag;
+            state.sessionsEtagFor = key;
+            // A 304 is an answer. The server has just said the list on screen is current, so this
+            // is fresh — leaving it out is what let a list failure sit there with nothing on the
+            // page to show for it. `renderSessionSelect` does not re-render, so the bar is told
+            // separately, and only when its contents actually moved.
+            var cleared = noteFresh('sessions', true, '');
+            if (!result.changed) {
+              if (cleared) renderBars();
+              return false;
+            }
+            state.sessions = Array.isArray(result.body.sessions) ? result.body.sessions : [];
             state.sessionsLoaded = true;
-            state.sessionsError = false;
             renderSessionSelect();
+            if (cleared) renderBars();
+            return true;
           })
           .catch(function (error) {
             sessionsInflight = null;
-            if (error && error.name === 'AbortError') return;
-            state.sessionsError = true;
+            if (error && error.name === 'AbortError') return false;
+            noteFresh('sessions', false, freshnessReason(error));
+            renderBars();
+            return false;
           });
       }
 
@@ -3995,10 +4123,19 @@
             if (payload === null) {
               // 304: the previous render is still accurate. Only clear a pending loading
               // state, because nothing on screen should have been replaced.
+              //
+              // The server answered, though, so this is fresh. Treating a 304 as "nothing
+              // happened" is what let the warning outlive the fault that raised it — a quiet
+              // session revalidates into a 304 every tick, so once it was up, only a session
+              // that started growing again could take it down.
+              var cleared = noteFresh('trajectory', true, '');
               if (state.loading) {
                 state.loading = false;
-                render();
+                cleared = true;
               }
+              // Rendering on every 304 would rebuild the whole ledger every 8 seconds on an
+              // idle session. Escaping the sticky banner must not cost that.
+              if (cleared) render();
               return;
             }
             applyPayload(payload, manual);
@@ -4008,6 +4145,91 @@
             inflight = null;
             if (error && error.name === 'AbortError') return;
             handleTrajectoryError(error);
+          });
+      }
+
+      /**
+       * Asks the server which records a needle matches, and puts the answer in force.
+       *
+       * Three things this has to get right, and each of them used to be free when the page scanned
+       * its own records:
+       *
+       *  - **A late answer must not win.** Every request carries a sequence number, and only the
+       *    newest one is allowed to write. Typing "abc" then "abcd" must not leave "abc" on screen
+       *    because its slower answer arrived second.
+       *  - **A needle of one character is not a question.** The server refuses it, and the page
+       *    does not ask: a needle that short matches nearly every record, and the answer would be
+       *    the whole ledger arriving to be discarded.
+       *  - **A changed session invalidates the answer.** The hit set names record indexes of a
+       *    projection that has since been replaced, so a poll that changed the payload re-runs the
+       *    search rather than filtering the new table by the old answer. That is one writer —
+       *    applyPayload — because two callers deciding when to re-search is two chances to forget.
+       *
+       * @param {string} needle
+       */
+      function runSearch(needle) {
+        if (searchController) searchController.abort();
+        var asked = String(needle == null ? '' : needle).trim();
+        if (asked === '') {
+          state.searchHits = null;
+          state.searchPending = false;
+          state.searchTotal = 0;
+          state.searchTruncated = false;
+          searchSeq += 1;
+          return;
+        }
+        var controller = new AbortController();
+        searchController = controller;
+        var seq = (searchSeq += 1);
+        state.searchPending = true;
+        var session = sessionParam();
+        var url = '/api/trajectory/search?session=' + session
+          + '&q=' + encodeURIComponent(asked)
+          + (state.generation === null ? '' : '&generation=' + encodeURIComponent(String(state.generation)));
+
+        fetch(url, { signal: controller.signal, headers: { Accept: 'application/json' } })
+          .then(function (response) {
+            return response
+              .json()
+              .catch(function () { return null; })
+              .then(function (body) {
+                if (!response.ok || !body || typeof body !== 'object') {
+                  var error = new Error('api');
+                  error.status = response.status;
+                  error.code = body && body.error ? body.error : 'unknown';
+                  throw error;
+                }
+                return body;
+              });
+          })
+          .then(function (body) {
+            if (seq !== searchSeq) return;
+            searchController = null;
+            state.searchPending = false;
+            state.searchHits = searchHitSet(body.hits);
+            state.searchTotal = Number.isInteger(body.total) ? body.total : 0;
+            state.searchTruncated = body.truncated === true;
+            // An answer that arrived retires the failure that preceded it. This line is here
+            // because the two other places that clear the field are the two a READER triggers —
+            // typing in the box and pressing clear — so nothing else could. A poll that re-runs the
+            // current query after the transcript changed is not a reader, and before this line a
+            // search that had failed once said 「搜索失败，以下为上次结果」 for the rest of the
+            // session: the label reads the error first, so the stale one outranked the fresh hit
+            // set it was describing.
+            state.searchError = null;
+            resetWindowMode();
+            renderLedger();
+          })
+          .catch(function (error) {
+            if (seq !== searchSeq) return;
+            searchController = null;
+            state.searchPending = false;
+            if (error && error.name === 'AbortError') return;
+            // A search that could not be answered leaves the previous answer standing rather than
+            // emptying the table: 「没搜到」 and 「没搜成」 are different, and only one of them is
+            // true. The count line carries the reason.
+            state.searchError = error && error.code ? String(error.code) : 'search_failed';
+            renderLedger();
           });
       }
 
@@ -4126,10 +4348,55 @@
         return { session: delta.session, stats: delta.stats, turns: turns };
       }
 
+      /**
+       * Whether this delta was cut from the numbering the page is still holding.
+       *
+       * The cursor is `record.index`, and the server can renumber a payload that is otherwise
+       * untouched: a message arriving that is a newer version of an earlier one suppresses that
+       * earlier copy, and every record after it shifts down. A tail cut at the old number then
+       * lands in the middle of the wrong turn — no error, no empty table, just records in the
+       * wrong place, which is the kind of wrong a reader cannot notice and cannot believe.
+       *
+       * So the delta names the record its cursor pointed at, and this compares it against the one
+       * the page holds at that index. They agree, nothing before the cursor moved, and the tail is
+       * this payload's. They do not, and the only honest answer is the whole payload.
+       *
+       * A delta with no `basedOn` at all is refused rather than trusted: this page cannot tell such
+       * a tail from a correct one, and guessing 「it is probably fine」 is the failure it exists to
+       * prevent.
+       */
+      function deltaMatchesNumbering(previous, delta) {
+        var based = delta && delta.delta ? delta.delta.basedOn : null;
+        if (!based || typeof based.index !== 'number' || based.index < 0) return false;
+        if (based.index === 0) return true;
+        var turns = previous && Array.isArray(previous.turns) ? previous.turns : [];
+        for (var i = 0; i < turns.length; i += 1) {
+          var records = Array.isArray(turns[i].records) ? turns[i].records : [];
+          for (var j = 0; j < records.length; j += 1) {
+            var record = records[j];
+            if (!record || record.index !== based.index) continue;
+            return String(record.id) === String(based.id);
+          }
+        }
+        return false;
+      }
+
       function applyPayload(body, manual) {
         // A delta is only ever laid onto a payload this page actually has. Without one —
         // first load, a session switch, a manual refresh — the whole payload is the answer.
-        var mergeable = body && body.delta && state.payload && Array.isArray(state.payload.turns);
+        var hasDelta = !!(body && body.delta && state.payload && Array.isArray(state.payload.turns));
+        // And only when the numbering it was cut from is the numbering in hand. This is checked
+        // BEFORE the merge and returns early, because the alternative — merging it and noticing
+        // afterwards — leaves records in the wrong turn with nothing to undo them.
+        if (hasDelta && !deltaMatchesNumbering(state.payload, body)) {
+          state.since = null;
+          state.sinceFor = null;
+          state.loading = true;
+          render();
+          fetchTrajectory(true);
+          return;
+        }
+        var mergeable = hasDelta;
         var payload = mergeable ? mergeDelta(state.payload, body) : body;
         var next = signatureOf(payload);
         var changed = next !== state.signature;
@@ -4137,7 +4404,7 @@
         state.signature = next;
         state.loading = false;
         state.hardError = null;
-        state.stale = false;
+        noteFresh('trajectory', true, '');
         state.flat = flattenTurns(payload.turns);
         // The cursor is the server's own word for how far it got, so a delta is O(1) here and
         // only a whole payload has to walk the records to find the end of them.
@@ -4157,6 +4424,12 @@
         // table shows goes through; answering the question here as well would give the field two
         // writers, and the poll path is the one that used to leave it stale.
         if (changed) rePinWindow();
+        // The hit set names record indexes of the payload that was on screen a moment ago. A
+        // payload that just changed is a different set of indexes, so filtering the new table by
+        // the old answer would show the reader rows that never matched. Re-running it here is the
+        // whole of the rule; doing it at the reader would leave the poll path stale, which is the
+        // same mistake the window pinning above used to make.
+        if (changed && state.query) runSearch(state.query);
         render();
         if (manual) announce('已刷新，正在显示最新数据。');
       }
@@ -4166,17 +4439,11 @@
         // Never surface status codes, URLs, or local paths.
         var serverMessage = error && error.serverMessage ? String(error.serverMessage) : '';
         if (state.payload) {
-          state.stale = true;
-          var code = error && error.code ? error.code : '';
-          var title = dom.staleBar.querySelector('.bar-title');
-          if (title) {
-            if (code === 'session_not_found' || code === 'not_found') title.textContent = '该会话已不可用，正在重试';
-            else if (code === 'trajectory_unavailable') title.textContent = '本地会话数据目录暂时不可用，正在重试';
-            else if (code === 'trajectory_unreadable') title.textContent = '会话数据暂时无法读取，正在重试';
-            else title.textContent = '更新失败，正在重试';
-          }
+          // There is something on screen and it is now out of date. That is this layer's whole
+          // subject, so it is reported here rather than as a hard error — which is for a reader
+          // who has nothing at all to look at.
+          noteFresh('trajectory', false, freshnessReason(error));
         } else {
-          state.stale = false;
           state.hardError = serverMessage || '暂时无法读取会话轨迹数据。';
         }
         render();
@@ -4194,13 +4461,26 @@
        * absence of a number in the shape of a number. Omitting the segment is the honest rendering
        * of 「这个数不存在」: the reader still has the label and the recency, which is what the picker
        * is for. tests/verify-list-cache.mjs pins the gate that produces the absence. */
+      /* 「子会话」 says the structural fact and stops there.
+       *
+       * The parent is named by nobody, on purpose. A branch is always newer than the session that
+       * spawned it, so its parent has usually aged out of the most-recent-N window this list is
+       * built from — naming it would mean a lookup that fails exactly when a reader wants the
+       * answer most, and a lookup that fails quietly is how a picker ends up asserting something
+       * it cannot see.
+       *
+       * It is a marker and not a filter: nothing here writes state, so there is no second opinion
+       * about which records are on screen that could disagree with the table. */
+      var BRANCH_MARK = ' · 子会话';
+
       function sessionOptionLabel(session, now) {
         var label = truncateText(session && session.label ? session.label : '', 42);
         var when = formatAgo(session ? session.lastActiveAt : null, now);
         var count = session ? session.messageCount : null;
         var tail = isCount(count) ? '（' + when + ' · ' + formatInt(count) + ' 条）' : '（' + when + '）';
-        if (!label) return '未命名会话 ' + tail;
-        return label + ' ' + tail;
+        var branch = session && session.sessionParentId ? BRANCH_MARK : '';
+        if (!label) return '未命名会话 ' + tail + branch;
+        return label + ' ' + tail + branch;
       }
 
       function renderSessionSelect() {
@@ -4290,22 +4570,6 @@
       }
 
       /**
-       * What the turn count leaves out — a DIFFERENT population, not more of the same one.
-       * A checkpoint is not a conversation and a continuation is not a new one.
-       *
-       * This line used to sit in the same `·`-separated run as the breakdown, which put two
-       * numbers worth 5 side by side: 续作答答 (the turns that stopped to ask) and 续作 (the
-       * prompt-less turns that carried the answers). They are disjoint — overlap measured 0 —
-       * but read as one list they look like the same five counted twice. 另有 marks the
-       * boundary so the second group cannot be added to the first by eye.
-       */
-      function turnContext(stats) {
-        return turnContextParts(stats).map(function (p) {
-          return p.label + ' ' + p.value;
-        }).join(' · ');
-      }
-
-      /**
        * The out-of-headline terms, each tagged with the kind it stands for — or null when it
        * counts turns rather than records. 追加 is the steer records and 压缩 is the compaction
        * records, so those two are literally what the chips filter. The rest count turns, which
@@ -4328,15 +4592,19 @@
         return parts;
       }
 
-      function turnContextSuffix(stats) {
-        var context = turnContext(stats);
-        return context ? '   ·   另有 ' + context : '';
-      }
-
       /**
-       * The same line, with the two record-counting terms as live controls. Pressed state is
-       * read from state.kinds, so it is the same state the chips show and cannot disagree;
-       * the accessible name is the chip's, word for word.
+       * The line under 对话轮次: the breakdown, then 另有 and a DIFFERENT population — not more
+       * of the same one. A checkpoint is not a conversation and a continuation is not a new one.
+       *
+       * That second group used to sit in the same `·`-separated run as the breakdown, which put
+       * two numbers worth 5 side by side: 续作答答 (the turns that stopped to ask) and 续作 (the
+       * prompt-less turns that carried the answers). They are disjoint — overlap measured 0 —
+       * but read as one list they look like the same five counted twice. 另有 marks the
+       * boundary so the second group cannot be added to the first by eye.
+       *
+       * The two record-counting terms are live controls here. Pressed state is read from
+       * state.kinds, so it is the same state the chips show and cannot disagree; the accessible
+       * name is the chip's, word for word.
        */
       function turnSubNode(stats) {
         var wrap = el('span', 'kpi-sub');
@@ -4400,9 +4668,14 @@
        * how many records are not loaded, which is the question it actually answers.
        */
       function turnRangeLabel(firstTurn, lastTurn) {
-        if (!isCount(firstTurn) || !isCount(lastTurn)) return DASH;
-        if (firstTurn === lastTurn) return '第 ' + formatInt(firstTurn) + ' 轮';
-        return '第 ' + formatInt(firstTurn) + '–' + formatInt(lastTurn) + ' 轮';
+        var range = DASH;
+        if (isCount(firstTurn) && isCount(lastTurn)) {
+          range = firstTurn === lastTurn
+            ? '第 ' + formatInt(firstTurn) + ' 轮'
+            : '第 ' + formatInt(firstTurn) + '–' + formatInt(lastTurn) + ' 轮';
+        }
+        var status = searchStatusLabel(state);
+        return status ? range + ' · ' + status : range;
       }
 
       /**
@@ -4433,6 +4706,13 @@
         var stats = {
           messages: 0,
           userMessages: 0,
+          // Prompts written mid-turn are counted apart from prompts that opened one, and this
+          // copy of the server's stats shape had lost the field: the server declares
+          // `steers: 0` and this literal did not, so the `+= 1` below ran on `undefined`, every
+          // value became NaN, and `isCount()` refused it. The whole-session cards read the
+          // server's stats and showed 「追加 N」; these are the same numbers re-scoped to a range,
+          // so the moment a range went on the term disappeared from the card that reports it.
+          steers: 0,
           toolCalls: 0,
           toolResults: 0,
           thinkingBlocks: 0,
@@ -4634,7 +4914,10 @@
       var OVERVIEW_EDGE_PAN_ZONE = 0.08;
       var OVERVIEW_EDGE_PAN_MAX_PX = 32;
 
-      var overviewCache = { model: null, view: null, fullDuration: 1, minDuration: 1 };
+      // `flat` and `axis` are the model's inputs, and they are here so the model can be reused
+      // rather than rebuilt — see `cachedOverviewModel`. They are not a second source of truth:
+      // a hit is only allowed when BOTH still match, so a stale model cannot be shown.
+      var overviewCache = { model: null, view: null, fullDuration: 1, minDuration: 1, flat: null, axis: null };
       // The window bar's nodes, built on first use and then reused. Null until then.
       var windowBarParts = null;
       var overviewDrag = null;
@@ -4726,7 +5009,10 @@
           if (!isCount(timestamp)) continue;
           var range = timedRange(record, prevTimestamp, timestamp);
           timed.push({
-            id: record.id,
+            // The span's key is the ROW's, not the message's: one span is one record, and the
+            // hover hairline, the tooltip and the time brush all have to find the span the
+            // reader is pointing at rather than the last one its message expanded into.
+            id: recordKey(record),
             record: record,
             start: range.start,
             end: range.end,
@@ -4807,7 +5093,7 @@
 
       function recordInSelection(record, selection, spansById) {
         if (!selection) return true;
-        var span = spansById.get(record.id);
+        var span = spansById.get(recordKey(record));
         // A record with no span has no position on the strip, so a range cannot claim
         // to contain it. Leaving it out is the honest answer; putting it in would let
         // a time brush silently match records it never saw.
@@ -4821,11 +5107,127 @@
         return { start: model.start, duration: Math.max(1e-6, model.end - model.start) };
       }
 
+      /**
+       * How many pixel columns the strip has — or `spanCount` when it has not been laid out.
+       *
+       * The fallback is load-bearing rather than defensive: a strip that has never been measured
+       * must not collapse into one column (a solid block) or into an unbounded loop. Falling
+       * back to one column per record is exactly what shipped before, which is a safe way to be
+       * wrong, and it means this function cannot make the picture worse than it was.
+       */
+      function overviewColumnCount(lanes, spanCount) {
+        if (!lanes || typeof lanes.getBoundingClientRect !== 'function') return spanCount;
+        var width = lanes.getBoundingClientRect().width;
+        if (!(width > 0)) return spanCount;
+        return Math.max(1, Math.round(width));
+      }
+
+      /**
+       * Which column a moment on the axis falls in — measured against the VIEW, not the domain,
+       * because a column is a pixel of the strip the reader is looking at, and the strip shows
+       * the view.
+       *
+       * @returns {number} 0..columns, clamped: a moment outside the view still has to land
+       *   somewhere rather than index out of the bucket map.
+       */
+      function overviewColumnAt(time, view, columns) {
+        var duration = view && view.duration > 0 ? view.duration : 1;
+        var column = Math.floor(((time - view.start) / duration) * columns);
+        if (!isFinite(column) || column < 0) return 0;
+        if (column > columns) return columns;
+        return column;
+      }
+
+      /**
+       * One `.ov-span` node.
+       *
+       * Colour, opacity, lane and the `data-kind` rules all still come from the stylesheet: this
+       * decides only how MANY nodes there are and where they sit. A `column` of null means the
+       * node stands for one record at that record's own position — used for the selected record
+       * and for a hover, neither of which is a range.
+       */
+      function overviewAppendSpan(lanes, span, column, columns, view, model, fullDuration) {
+        var marker = column === null;
+        var left = marker ? (span.start - model.start) / fullDuration : column / columns;
+        var width = marker ? (span.end - span.start) / fullDuration : 1 / columns;
+        var node = el('span', 'ov-span');
+        node.setAttribute('data-kind', span.record.kind);
+        if (span.record.kind === 'toolResult' && span.record.isError === true) node.setAttribute('data-error', 'true');
+        node.style.setProperty('--ov-lane', String(span.lane));
+        node.style.setProperty('--ov-left', (left * 100).toFixed(4) + '%');
+        node.style.setProperty('--ov-width', (width * 100).toFixed(4) + '%');
+        // A column is one pixel wide. `.ov-span` floors at 2px, which would make every column
+        // overlap its right-hand neighbour and shift the whole picture by one pixel — so the
+        // floor is a custom property and a column lowers it. The default stays 2px for the
+        // markers, which are positioned by their record and should read as a dot, not a pixel.
+        node.style.setProperty('--ov-min', marker ? '2px' : '1px');
+        node.style.setProperty('--ov-gap', '0px');
+        node.setAttribute('data-record-id', span.id);
+        if (span.record.id === state.selectedId) node.setAttribute('data-current', 'true');
+        lanes.appendChild(node);
+        return node;
+      }
+
+      /**
+       * The selected record, as its own node rather than as part of a column.
+       *
+       * @param {string|null} recordId
+       * @param {string} markerAttr an attribute the caller can find and remove again
+       */
+      function overviewAppendMarker(lanes, recordId, markerAttr, columns, view, model, fullDuration) {
+        if (!recordId) return null;
+        var span = overviewSpansById.get(recordId);
+        if (!span) return null;
+        var node = overviewAppendSpan(lanes, span, null, columns, view, model, fullDuration);
+        node.setAttribute(markerAttr, 'true');
+        return node;
+      }
+
+      /**
+       * The model for the rows on screen, rebuilt only when one of its two inputs has changed.
+       *
+       * WHY. Building it costs one object per dated record — measured 59.6 ms of a 186.3 ms
+       * `renderOverview` on a 36,525-record session — and seven of the eight callers of
+       * `renderOverview` change neither input: filtering, selecting, brushing, wheel, edge-pan
+       * (a 60 ms timer) and a session switch all re-enter here with the same rows and the same
+       * axis. So this is not a new cache with a policy to invent; it is the two inputs, compared.
+       *
+       * THE KEY IS IDENTITY, and that is the whole correctness argument:
+       *
+       *   - `state.flat` has exactly one writer (`flattenTurns` on every applied payload) and is
+       *     never mutated in place, so a new array means new rows and the same array means the
+       *     same rows. Comparing contents instead would cost a pass over every record — the work
+       *     being saved — to answer a question identity already answers.
+       *   - `state.actualDuration` is the model's other input, and its own setter returns early
+       *     when the value is unchanged, so comparing it is comparing state, not re-deriving it.
+       *
+       * Both together are what make a hit safe. Keying on the rows alone would keep a model built
+       * on the other axis, and the strip would draw every record at its position on the axis the
+       * reader just turned off.
+       *
+       * The one thing this does NOT cover is `turnKey`'s `Math.random()` fallback, which fires
+       * only for a turn carrying neither `id` nor `index`. The payload gives every turn an
+       * `index`, so that branch is unreachable from here — and `visibleTurns`, which is not
+       * cached, reaches the same fallback, so the page's behaviour does not hinge on it.
+       *
+       * @param {Array<{turn: any, record: any}>} flat
+       * @returns {{spans: Array<any>, turnBoundaries: Array<any>, start: number, end: number} | null}
+       */
+      function cachedOverviewModel(flat) {
+        if (overviewCache.flat === flat && overviewCache.axis === state.actualDuration) {
+          return overviewCache.model;
+        }
+        var model = overviewModel(flat);
+        overviewCache.model = model;
+        overviewCache.flat = flat;
+        overviewCache.axis = state.actualDuration;
+        return model;
+      }
+
       function renderOverview() {
         var track = dom.overviewTrack;
         if (!track) return;
-        var model = overviewModel(state.flat);
-        overviewCache.model = model;
+        var model = cachedOverviewModel(state.flat);
         if (!model) {
           clear(dom.overviewTurns);
           clear(dom.overviewLanes);
@@ -4848,36 +5250,77 @@
         track.style.setProperty('--ov-domain-left', ((view.start - model.start) / fullDuration * 100).toFixed(4) + '%');
         track.style.setProperty('--ov-domain-width', (view.duration / fullDuration * 100).toFixed(4) + '%');
 
-        var hasQuery = state.query !== '';
-        var filtering = hasQuery || state.kinds.length !== KIND_ORDER.length;
         var lanes = dom.overviewLanes;
         clear(lanes);
+
+        // One node per PIXEL COLUMN, not one per record.
+        //
+        // `.ov-span` is `width: max(2px, …)`, so at the measured 872px viewport the strip has
+        // ~436 slots and the 36,525 spans of the largest session were stacked ~42 deep on top
+        // of each other — the picture a reader saw was already "whichever record was painted
+        // last on this pixel", which is exactly what a column is. Bucketing therefore does not
+        // approximate the old picture, it is the old picture, one pixel sharper.
+        //
+        // Measured (`.probe/_strip-canvas-cost.mjs`, sandbox): 546.5 ms and 36,525 nodes at
+        // 36,525 records, against 3,937 ms in the browser. That is the whole cost of a rebuild
+        // that ran on every poll carrying a body.
+        //
+        // What is NOT approximated: the span map below is still built for every record, because
+        // `recordInSelection` reads it to decide whether a brushed range contains a record. Only
+        // the drawing is aggregated.
+        var columns = overviewColumnCount(lanes, model.spans.length);
+        overviewCache.columns = columns;
+        /** @type {Map<string, any>} last span painted into each `lane:column` */
+        var winners = new Map();
+        var painted = [];
+        var drawn = new Set();
+
         for (var i = 0; i < model.spans.length; i += 1) {
           var span = model.spans[i];
           overviewSpansById.set(span.id, span);
-          if (span.end < view.start || span.start > view.start + view.duration) {
-            if (span.record.id !== state.selectedId) continue;
-          }
-          var left = (span.start - model.start) / fullDuration;
-          var width = (span.end - span.start) / fullDuration;
-          var node = el('span', 'ov-span');
-          node.setAttribute('data-kind', span.record.kind);
-          if (span.record.kind === 'toolResult' && span.record.isError === true) node.setAttribute('data-error', 'true');
-          if (span.record.id === state.selectedId) node.setAttribute('data-current', 'true');
-          if (state.overviewHoverId === span.id) node.setAttribute('data-hovered', 'true');
+          if (span.end < view.start || span.start > view.start + view.duration) continue;
           // The strip claims to be a picture of the list below it, so it has to be one.
           // A record the filter excluded is not drawn faint — it is not drawn. Dimming
           // it kept the excluded work visible enough that turning off 工具结果 left the
           // tool lane reading as a solid band, which is indistinguishable from no filter
           // at all. Positions still come from the full model, so the axis does not move.
-          if (filtering && !spanPassesFilter(span.record)) continue;
-          node.style.setProperty('--ov-lane', String(span.lane));
-          node.style.setProperty('--ov-left', (left * 100).toFixed(4) + '%');
-          node.style.setProperty('--ov-width', (width * 100).toFixed(4) + '%');
-          node.style.setProperty('--ov-gap', Math.min(width * 100 * 0.08, 1).toFixed(4) + 'px');
-          node.setAttribute('data-record-id', span.id);
-          lanes.appendChild(node);
+          //
+          // Asked unconditionally, with no local "is anything filtered" flag in front of it.
+          // There used to be one, over two of the five axes, and it was the same defect the
+          // comment on `spanPassesFilter()` records: set only a time range, or only an anomaly
+          // rule, and the flag said nothing was filtered, so the strip kept drawing spans the
+          // list had already dropped — which a reader reads as "I filtered it and nothing
+          // changed". A flag listing the axes is a list that drifts the next time an axis is
+          // added, so the flag is gone rather than completed. The brush stays out of this
+          // because `spanPassesFilter` passes a null selection, not because it is missing here.
+          //
+          // Still the same line, still the same order: aggregation happens AFTER this asks, so
+          // the question of "which records belong on the strip" keeps exactly one owner.
+          if (!spanPassesFilter(span.record)) continue;
+
+          // A column's value is the record painted last on it, which is how overlapping spans
+          // already resolved. `for` runs in ledger order, so the last write wins.
+          var from = overviewColumnAt(span.start, view, columns);
+          var to = overviewColumnAt(span.end, view, columns);
+          if (to <= from) to = from + 1;
+          for (var c = from; c < to; c += 1) winners.set(span.lane + ':' + c, span);
         }
+
+        winners.forEach(function (span, key) {
+          var column = Number(key.slice(key.indexOf(':') + 1));
+          overviewAppendSpan(lanes, span, column, columns, view, model, fullDuration);
+          if (!drawn.has(span.id)) { drawn.add(span.id); painted.push(span.id); }
+        });
+
+        // The selected record gets its own node, on top, at its own position — not at the
+        // column it may have won. A column is a range, and 「这一条」 is not a range. It also
+        // covers the selected record sitting outside the current view, which no column can.
+        overviewAppendMarker(lanes, state.selectedId, 'data-current-marker', columns, view, model, fullDuration);
+
+        // What the strip actually shows, for the guard. "Every visible record has a node" is not
+        // a claim a reader could check at 42 records to the pixel; "every visible record falls
+        // inside a column that was drawn" is, and it is what this list is for.
+        overviewCache.painted = painted;
 
         var turns = dom.overviewTurns;
         clear(turns);
@@ -5065,13 +5508,56 @@
         return view.start + fraction * view.duration;
       }
 
+      /**
+       * The span under a point, or null.
+       *
+       * The SPAN rather than its key, because the two callers want different halves of it: a
+       * hover needs the span's own key to mark one row, and a click needs the record's message id
+       * because selection is per message. Returning the key forced both to use one number, and
+       * picking for the hover is what broke selection.
+       *
+       * @returns {any|null}
+       */
+      /**
+       * The record under a point on the strip, or null.
+       *
+       * The LANE still comes from the DOM, because the lanes are laid out in CSS and the pointer's
+       * y position is the only honest way to know which one it is over. The RECORD comes from the
+       * complete model.
+       *
+       * It used to come from the DOM entirely — `document.elementFromPoint` returned whichever
+       * node was topmost at that pixel. That was already arbitrary, since at the measured session
+       * forty-two records share a pixel, but it became arbitrary in a *new* way once the strip
+       * drew one node per column: only the record that won a column had a node at all, so every
+       * other record was unreachable by hover and by click. Resolving in time instead makes the
+       * answer the record nearest the pointer rather than the one painted last, which is the
+       * question a reader is asking either way.
+       */
       function spanAt(clientX, clientY) {
+        var lane = overviewLaneAt(clientX, clientY);
+        if (lane < 0) return null;
+        return nearestSpanAt(overviewTimeAt(overviewFractionAt(clientX)), lane);
+      }
+
+      /**
+       * Which lane the point is over, read off the node under it rather than recomputed here —
+       * the 14px lane pitch lives in the stylesheet and duplicating it in JS is a second copy of
+       * a number that decides what the reader is pointing at.
+       *
+       * @returns {number} the lane index, or -1 when the point is not over a span
+       */
+      function overviewLaneAt(clientX, clientY) {
         var node = document.elementFromPoint(clientX, clientY);
         while (node && node !== dom.overviewTrack) {
-          if (node.classList && node.classList.contains('ov-span')) return node.getAttribute('data-record-id');
+          if (node.classList && node.classList.contains('ov-span')) {
+            var declared = node.style && node.style.getPropertyValue
+              ? node.style.getPropertyValue('--ov-lane') : '';
+            var lane = Number(declared);
+            return Number.isFinite(lane) ? lane : -1;
+          }
           node = node.parentNode;
         }
-        return null;
+        return -1;
       }
 
       function cancelOverviewHover() {
@@ -5186,7 +5672,8 @@
 
         // Idle: a hairline marks the pointer, and a span shows its detail only after
         // the reader has held still long enough to mean it.
-        var id = spanAt(event.clientX, event.clientY);
+        var hovered = spanAt(event.clientX, event.clientY);
+        var id = hovered ? hovered.id : null;
         dom.overviewHover.hidden = false;
         dom.overviewHover.style.setProperty('--ov-hover-left', (fraction * 100).toFixed(3) + '%');
         if (overviewHoverTimer !== null) window.clearTimeout(overviewHoverTimer);
@@ -5204,11 +5691,31 @@
       }
 
       function markOverviewHover(id) {
-        var nodes = dom.overviewLanes.querySelectorAll('[data-record-id]');
+        var lanes = dom.overviewLanes;
+        if (!lanes) return;
+        state.overviewHoverId = id || null;
+        var nodes = lanes.querySelectorAll('[data-record-id]');
+        var found = false;
         for (var i = 0; i < nodes.length; i += 1) {
-          if (nodes[i].getAttribute('data-record-id') === id) nodes[i].setAttribute('data-hovered', 'true');
-          else nodes[i].removeAttribute('data-hovered');
+          if (id && nodes[i].getAttribute('data-record-id') === id) {
+            nodes[i].setAttribute('data-hovered', 'true');
+            found = true;
+          } else {
+            nodes[i].removeAttribute('data-hovered');
+          }
         }
+        // The strip draws one node per pixel column now, so the hovered record usually does not
+        // have a node of its own — it lost its column to whichever record was painted last on
+        // that pixel, which at the measured session is one of about forty-two. Without this the
+        // hover highlight would simply stop existing on a big session, and the table row it
+        // marks would be pointing at nothing. One extra node, not one per record.
+        var previous = lanes.querySelector('[data-hovered-marker]');
+        if (previous) lanes.removeChild(previous);
+        if (!id || found) return;
+        var span = overviewSpansById.get(id);
+        if (!span) return;
+        overviewAppendMarker(lanes, id, 'data-hovered-marker', overviewCache.columns, overviewCache.view,
+          overviewCache.model, overviewCache.fullDuration);
       }
 
       /** Keep brushing usable once the axis is zoomed in: slide the window near the edges. */
@@ -5263,13 +5770,13 @@
         }
 
         if (!drag.moved) {
-          var id = spanAt(event.clientX, event.clientY);
-          if (id) {
+          var span = spanAt(event.clientX, event.clientY);
+          if (span) {
             clearOverviewSelection();
-            selectRecord(id);
+            selectRecord(span.record.id);
           } else {
             var nearest = nearestSpanAt(overviewTimeAt(overviewFractionAt(event.clientX)));
-            if (nearest) selectRecord(nearest);
+            if (nearest) selectRecord(nearest.record.id);
           }
           return;
         }
@@ -5289,21 +5796,38 @@
         renderLedger();
       }
 
-      function nearestSpanAt(time) {
+      /**
+       * The span nearest a point in time, or null. The span, for the reason spanAt() gives.
+       *
+       * Read off the COMPLETE model rather than the painted nodes, so a record that owns no
+       * column is still reachable. `lane`, when given, restricts the search to one row of the
+       * strip; without it a wheel gesture can work in time alone.
+       *
+       * @param {number} time
+       * @param {number} [lane]
+       */
+      function nearestSpanAt(time, lane) {
         var model = overviewCache.model;
         if (!model) return null;
         var best = null;
         var bestDistance = Infinity;
         for (var i = 0; i < model.spans.length; i += 1) {
           var span = model.spans[i];
+          // A lane is optional because not every caller has one to offer: a wheel gesture works in
+          // time alone, while a pointer also says which row it is over.
+          if (lane !== undefined && span.lane !== lane) continue;
+          // Both distances are the LARGER time minus the SMALLER one, so both are positive and the
+          // `<` below keeps the closest. Subtracting the other way round leaves both negative,
+          // which still lets a first candidate in against Infinity and then keeps every further one
+          // that is further away -- the strip would answer with the record farthest from the pointer.
           if (span.end < time) {
-            var after = span.end - time;
-            if (after < bestDistance) { bestDistance = after; best = span.id; }
+            var after = time - span.end;
+            if (after < bestDistance) { bestDistance = after; best = span; }
           } else if (span.start > time) {
-            var before = time - span.start;
-            if (before < bestDistance) { bestDistance = before; best = span.id; }
+            var before = span.start - time;
+            if (before < bestDistance) { bestDistance = before; best = span; }
           } else {
-            return span.id;
+            return span;
           }
         }
         return best;
@@ -5397,7 +5921,7 @@
           return passesAnomaly(record, { turn: turn || null, liveTurn: liveTurn() }, state.anomaly.rules);
         }
         if (!hasKind(record, state.kinds)) return false;
-        if (state.query && !matchesQuery(record, state.query)) return false;
+        if (state.query && !matchesQuery(record, state.query, state.searchHits)) return false;
         // The overview brush is a further filter, applied after kind and text so that
         // clearing it never silently changes what the other two meant.
         if (selection && !recordInSelection(record, selection, overviewSpansById)) return false;
@@ -5611,10 +6135,13 @@
         var record = entry.record;
         var row = el('button', 'row');
         row.type = 'button';
-        row.setAttribute('data-row-id', record.id || String(record.index));
+        // The scroll anchor reads this back with querySelector, which returns the FIRST match.
+        // Keyed by the message id it would resolve to the first row of the message, so a reader
+        // whose topmost row was the seventh of eight came back at the first. One row, one key.
+        row.setAttribute('data-row-id', recordKey(record));
         if (record.id === state.selectedId) row.setAttribute('aria-current', 'true');
         else row.removeAttribute('aria-current');
-        var failed = !!(record.isError || record.error);
+        var failed = record.isError === true;
         if (failed) row.classList.add('is-error');
 
         row.appendChild(el('span', 'row-index', '#' + (isCount(record.index) ? record.index : DASH)));
@@ -5622,7 +6149,11 @@
         var label = pill(kindLabel(record), kindTone(record.kind));
         row.appendChild(label);
 
-        var summaryText = record.summary || record.text || record.toolName || record.title || '';
+        // The server derives this one, folding in the tool name and the title when a record has no
+        // text of its own. It used to be a four-step chain here; measured over this machine's
+        // store, the `text` step never decided a single row, and the other two now live server-side
+        // where the rest of the summary is made.
+        var summaryText = record.summary || '';
         var summary = el('span', 'row-summary', truncateText(safeText(summaryText), 160) || DASH);
         summary.title = truncateText(safeText(summaryText), 600);
         row.appendChild(summary);
@@ -5636,7 +6167,7 @@
         // finished normally — but on the row the only thing separating it from an answer is
         // the absence of one, and a row that silently shows nothing is indistinguishable from
         // one the page failed to load.
-        var silent = record.kind === 'reply' && isNil(record.text);
+        var silent = record.kind === 'reply' && record.hasText === false;
         if (failed) {
           row.appendChild(pill('失败', 'error'));
           row.title = '失败 · 耗时 ' + durationText + '（详情见右侧检视）';
@@ -5682,7 +6213,7 @@
         var record = entry.record;
         var band = el('button', 'compaction-band');
         band.type = 'button';
-        band.setAttribute('data-row-id', record.id || String(record.index));
+        band.setAttribute('data-row-id', recordKey(record));
         if (record.id === state.selectedId) band.setAttribute('aria-current', 'true');
         else band.removeAttribute('aria-current');
 
@@ -5694,7 +6225,7 @@
         var opened = isCount(record.generation)
           ? '开启第 ' + formatInt(record.generation) + ' 代'
           : '开启新的一代';
-        var summary = truncateText(safeText(record.summary || record.text || ''), 200);
+        var summary = truncateText(safeText(record.summary), 200);
         band.appendChild(el('span', 'compaction-what', summary ? summary : '之前的上下文已被摘要'));
 
         var when = isNil(record.relativeMs)
@@ -7638,23 +8169,21 @@
           id: 'args',
           label: '参数',
           available: function (record) {
-            return record.kind === 'toolCall' && record.arguments !== null && record.arguments !== undefined;
+            return record.kind === 'toolCall' && record.hasArguments === true;
           }
         },
         {
           id: 'result',
           label: '结果',
           available: function (record) {
-            return record.kind === 'toolResult' && record.result !== null && record.result !== undefined;
+            return record.kind === 'toolResult' && record.hasResult === true;
           }
         },
         {
           id: 'thinking',
           label: '思考',
           available: function (record) {
-            if (record.kind !== 'thinking') return false;
-            var value = record.thinking;
-            return value !== null && value !== undefined && safeText(value).trim() !== '';
+            return record.kind === 'thinking' && record.hasThinking === true;
           }
         }
       ];
@@ -7799,9 +8328,9 @@
       function buildPanel(tabId, record, turn) {
         if (tabId === 'summary') return buildSummary(record, turn);
         if (tabId === 'raw') return buildRaw(record);
-        if (tabId === 'args') return buildBlock('工具参数', record.arguments, true);
-        if (tabId === 'result') return buildBlock('工具结果', record.result, false);
-        return buildBlock('思考过程', record.thinking, false);
+        if (tabId === 'args') return buildDetailBlock('工具参数', record, 'arguments', true);
+        if (tabId === 'result') return buildDetailBlock('工具结果', record, 'result', false);
+        return buildDetailBlock('思考过程', record, 'thinking', false);
       }
 
       function buildSummary(record, turn) {
@@ -7811,13 +8340,23 @@
         wrap.style.flexDirection = 'column';
         wrap.style.gap = '12px';
 
-        if (record.isError || record.error) {
+        // `isError` alone decides this. It used to be `isError || error`, and that second term was
+        // never a second opinion: `error` was the same string as `result`, set only when
+        // `isError` was already true, so the test could only ever have agreed. The text it showed
+        // is `result`, which now arrives with the record's details.
+        if (record.isError === true) {
           var alert = el('div', 'bar bar-danger');
           var texts = el('div');
           texts.appendChild(el('p', 'bar-title', '失败'));
-          texts.appendChild(el('p', 'bar-hint', safeText(record.error) || '该记录以错误结束，但没有给出错误信息。'));
+          var hint = el('p', 'bar-hint', '正在读取错误信息…');
+          texts.appendChild(hint);
           alert.appendChild(texts);
           wrap.appendChild(alert);
+          fetchDetail(record).then(function (detail) {
+            hint.textContent = safeText(detail.result) || '该记录以错误结束，但没有给出错误信息。';
+          }, function () {
+            hint.textContent = '该记录以错误结束，错误信息暂时取不到。';
+          });
         }
 
         var scroll = el('div', 'table-scroll');
@@ -7851,7 +8390,7 @@
         kvRow(table, '提供方', isNil(record.provider) ? DASH : String(record.provider));
         kvRow(table, '接口', isNil(record.api) ? DASH : String(record.api));
         kvRow(table, '结束原因', isNil(record.stopReason) ? DASH : String(record.stopReason));
-        kvRow(table, '状态', record.isError || record.error ? '失败' : '已完成');
+        kvRow(table, '状态', record.isError === true ? '失败' : '已完成');
         scroll.appendChild(table);
         wrap.appendChild(scroll);
 
@@ -7891,7 +8430,11 @@
         var session = payload && payload.session ? payload.session : null;
         var sid = session && typeof session.id === 'string' ? session.id : '';
         var gen = state.generation === null ? 'all' : String(state.generation);
-        return sid + '#' + gen + '#' + index;
+        // The validator belongs in this key. A record index is only a position within one version
+        // of one body: the same index in the next version of the session is a different message.
+        // Without the tag, a body that changed since the raw was read kept being served from here
+        // forever, and the page had no way to notice. Pinned by tests/verify-raw-lazy.mjs.
+        return sid + '#' + gen + '#' + (state.etag || '') + '#' + index;
       }
 
       function requestRaw(index) {
@@ -7915,6 +8458,11 @@
        * cache rolled past it. Reloading the session repopulates it, so that is tried once
        * before giving up; without the retry the tab would be permanently broken after any
        * restart, and without the retry cap it would loop.
+       *
+       * A 409 `raw_stale` is deliberately NOT on that path. It means the file a record was read
+       * from has been rewritten, which is not something a reload retries its way out of on a
+       * timer — and the reader is told so by the same 原文读取失败 line every other raw failure
+       * uses. A stale record is a hint, not an unavailable session.
        *
        * @param {Record<string, any>} record
        * @param {boolean} [retried]
@@ -7966,6 +8514,123 @@
         return fetchRaw(record);
       }
 
+      /* ---------------- record fields on demand ---------------- */
+
+      // The four bulk fields. They used to be on every row of every poll — 59.1% of the body,
+      // measured over this machine's whole session store — and the page held all of it to draw a
+      // row and, when a record was opened, four tabs. What a row carries now is four presence
+      // flags; this is where the values come from, for the one record the reader is looking at.
+      //
+      // The cache key is `rawCacheKey`'s, not a second one, and for the same reason: a record index
+      // is a position within one version of one body, so a value that changed since it was read
+      // must not keep being served. Sharing the key rather than copying it is what keeps the two
+      // answers from describing different versions of the same record.
+      var detailCache = {};
+      var detailPending = {};
+
+      function requestDetail(index) {
+        var url = '/api/trajectory/record?index=' + encodeURIComponent(String(index))
+          + '&session=' + sessionParam();
+        if (state.generation !== null) {
+          url += '&generation=' + encodeURIComponent(String(state.generation));
+        }
+        return fetch(url, { headers: { Accept: 'application/json' } }).then(function (response) {
+          return response.json().then(
+            function (body) { return { ok: response.ok, body: body }; },
+            function () { return { ok: false, body: null }; }
+          );
+        });
+      }
+
+      /**
+       * Resolves to the record's four bulk fields, or rejects.
+       *
+       * Same contract as `fetchRaw`: a 503 means the server released this session, so the session
+       * is reloaded once and the read retried; a 409 means the file moved, which a reload retries
+       * its way out of on a timer, so it is reported instead.
+       *
+       * @param {Record<string, any>} record
+       * @param {boolean} [retried]
+       */
+      function fetchDetail(record, retried) {
+        var index = record && record.index;
+        if (!isCount(index) || index < 1) return Promise.reject(new Error('record_index_missing'));
+        var key = rawCacheKey(index);
+        if (Object.prototype.hasOwnProperty.call(detailCache, key)) return Promise.resolve(detailCache[key]);
+        if (detailPending[key]) return detailPending[key];
+        var attempt = requestDetail(index).then(function (result) {
+          delete detailPending[key];
+          if (result.ok && result.body && typeof result.body.index === 'number') {
+            var entry = {
+              text: typeof result.body.text === 'string' ? result.body.text : null,
+              thinking: typeof result.body.thinking === 'string' ? result.body.thinking : null,
+              arguments: result.body.arguments === undefined ? null : result.body.arguments,
+              result: typeof result.body.result === 'string' ? result.body.result : null,
+              textTruncated: result.body.textTruncated === true
+            };
+            detailCache[key] = entry;
+            return entry;
+          }
+          var code = result.body && typeof result.body.error === 'string' ? result.body.error : '';
+          var err = new Error(code || 'record_unavailable');
+          err.code = code;
+          throw err;
+        }).catch(function (err) {
+          if (!retried && err && err.code === 'trajectory_not_cached') {
+            return new Promise(function (resolve) { resolve(fetchTrajectory(false)); })
+              .then(function () { return fetchDetail(record, true); });
+          }
+          throw err;
+        });
+        detailPending[key] = attempt;
+        return attempt;
+      }
+
+      /**
+       * The record's bulk fields, for a panel that draws them after it is on the page.
+       *
+       * Three states and they are not the same: not yet read, read and empty, and read and failed.
+       * A panel that cannot tell them apart either shows nothing for a record that has content, or
+       * shows a failure for one that simply has none.
+       *
+       * @param {string} title
+       * @param {Record<string, any>} record
+       * @param {string} field one of text / thinking / arguments / result
+       * @param {boolean} colored
+       */
+      function buildDetailBlock(title, record, field, colored) {
+        var wrap = el('div');
+        wrap.style.display = 'flex';
+        wrap.style.flexDirection = 'column';
+        wrap.style.gap = '8px';
+        wrap.appendChild(el('p', 'block-title', title));
+        var pre = el('pre', 'pre');
+        pre.setAttribute('tabindex', '0');
+        wrap.appendChild(pre);
+        pre.textContent = '正在读取…';
+        fetchDetail(record).then(function (detail) {
+          var value = detail[field];
+          if (detail.textTruncated === true) {
+            wrap.insertBefore(el('p', 'note', '正文已截断：仅保留前段内容。'), pre);
+          }
+          if (value === null || value === undefined) {
+            pre.textContent = DASH;
+            return;
+          }
+          var text = safeText(value);
+          if (!text) {
+            pre.textContent = DASH;
+          } else if (colored && typeof value === 'object') {
+            pre.innerHTML = jsonColorize(value);
+          } else {
+            pre.textContent = text;
+          }
+        }, function () {
+          pre.textContent = '读取失败，这条记录的详细内容暂时取不到。';
+        });
+        return wrap;
+      }
+
       function buildRaw(record) {
         var wrap = el('div');
         wrap.style.display = 'flex';
@@ -8004,26 +8669,6 @@
           if (Object.prototype.hasOwnProperty.call(record, key)) copy[key] = record[key];
         }
         return copy;
-      }
-
-      function buildBlock(title, value, colored) {
-        var wrap = el('div');
-        wrap.style.display = 'flex';
-        wrap.style.flexDirection = 'column';
-        wrap.style.gap = '8px';
-        wrap.appendChild(el('p', 'block-title', title));
-        var pre = el('pre', 'pre');
-        pre.setAttribute('tabindex', '0');
-        var text = safeText(value);
-        if (!text) {
-          pre.textContent = DASH;
-        } else if (colored && typeof value === 'object') {
-          pre.innerHTML = jsonColorize(value);
-        } else {
-          pre.textContent = text;
-        }
-        wrap.appendChild(pre);
-        return wrap;
       }
 
       /* ---------------- copy & handoff ---------------- */
@@ -8110,7 +8755,15 @@
         var record = entry.record;
         dom.handoffBtn.disabled = true;
         inspectorSay('正在读取原文…');
-        rawSourceFor(record).then(function (fetched) {
+        // Both reads are one step for the reader, and the detail one is allowed to fail on its own:
+        // the report is still worth sending without the error text, and saying so in the text is
+        // better than dropping the whole handoff over a field the reader may not even look at.
+        Promise.all([
+          rawSourceFor(record),
+          fetchDetail(record).then(function (detail) { return detail; }, function () { return null; })
+        ]).then(function (both) {
+          var fetched = both[0];
+          var detail = both[1];
           // A message too large to carry has no raw; the normalized record is then the most
           // there is, which is what this sent before raw became a separate fetch.
           var omitted = fetched.omitted === true;
@@ -8124,7 +8777,8 @@
             record,
             raw.text,
             raw.truncated,
-            omitted
+            omitted,
+            detail && detail.result ? detail.result : null
           );
           inspectorSay('已发出请求，等待你在弹出的确认框中确认…');
           var result = message.append(text);
@@ -8280,9 +8934,13 @@
         var shown = session && isCount(session.generation) ? session.generation : state.generation;
         dom.generationHint.hidden = !pinned;
         if (pinned) {
+          // Whether this generation is still growing is the difference between a promise and a
+          // description, and the picker can pin the live one. The old wording promised a sealed
+          // snapshot never changes while being shown for whichever generation was picked.
+          var live = !session || !isCount(session.activeGeneration) || session.activeGeneration === shown;
           dom.generationHint.textContent = '正在查看第 ' + formatInt(shown) +
-            ' 代上下文 —— 这是压缩前的历史快照，不会随后续对话更新。全部上下文共 ' +
-            formatInt(statsAll()) + ' 条消息。';
+            ' 代存储的上下文' + (live ? '，它仍在随后续对话更新' : '，这是当时封存的快照，不会随后续对话更新') +
+            '。全部上下文共 ' + formatInt(statsAll()) + ' 条消息。';
         }
       }
 
@@ -8296,11 +8954,36 @@
           dom.errorBar.hidden = false;
           dom.errorTitle.textContent = '无法读取会话轨迹';
           dom.errorText.textContent = state.hardError;
-        } else {
-          dom.errorBar.hidden = true;
-          dom.errorText.textContent = '';
+          // Nothing is on screen to be out of date, so the freshness bar has nothing to add to
+          // what the error bar already says. The counts are still being kept, so a later success
+          // hides this one and the freshness bar comes back on its own terms.
+          dom.staleBar.hidden = true;
+          return;
         }
-        dom.staleBar.hidden = !state.stale;
+        dom.errorBar.hidden = true;
+        dom.errorText.textContent = '';
+
+        // Two independent signals, and the worse one speaks. Either recovering must not hide the
+        // other, which is why this is not a single boolean with two writers.
+        var sources = ['trajectory', 'sessions'];
+        var worst = null;
+        for (var i = 0; i < sources.length; i += 1) {
+          var slot = freshness[sources[i]];
+          if (slot.streak > 0 && (worst === null || slot.streak > worst.streak)) {
+            worst = { source: sources[i], streak: slot.streak, reason: slot.reason };
+          }
+        }
+        dom.staleBar.hidden = worst === null;
+        if (worst === null) return;
+
+        var title = dom.staleBar.querySelector('.bar-title');
+        if (title) title.textContent = FRESH_TITLES[worst.reason] || FRESH_TITLES.offline;
+        var hint = dom.staleBar.querySelector('.bar-hint');
+        if (hint) {
+          hint.textContent = worst.streak >= FRESH_STREAK_SHOWN
+            ? FRESH_SOURCE_LABELS[worst.source] + '已连续 ' + worst.streak + ' 次更新失败。下方保留的是上一次成功读取的数据。'
+            : '下方保留的是上一次成功读取的数据。';
+        }
       }
 
       function renderFooter() {
@@ -8562,6 +9245,11 @@
       function resetBaseFilters() {
         state.kinds = KIND_ORDER.slice();
         state.query = '';
+        state.searchHits = null;
+        state.searchPending = false;
+        state.searchTotal = 0;
+        state.searchTruncated = false;
+        state.searchError = null;
         dropOverviewSelection();
         clearTimeRange();
         if (dom.searchInput) dom.searchInput.value = '';
@@ -8658,26 +9346,53 @@
 
       function startPolling() {
         stopPolling();
-        pollTimer = window.setInterval(function () {
+        // Two ticks, because the two fetches are not the same cost class and were never the same
+        // work. The list is a cached walk, a cached title read and a descriptor cache; once the
+        // page can revalidate it, an unchanged list costs a 304. The trajectory is the one that
+        // reparses a lineage and rebuilds a payload that measured 18,924 rows, and it also opens
+        // the runtime database on every request to work out which conversation is live.
+        //
+        // The list therefore keeps the fast tick, and it is not only for freshness: the picker
+        // renders 「刚刚」 against a render-time clock, so at a slow cadence that label would sit
+        // still and then jump. The trajectory gets the slower tick, and is woken early by the
+        // list instead of by the clock — see the fetchSessions call below.
+        sessionPollTimer = window.setInterval(function () {
+          if (document.hidden) return;
+          fetchSessions().then(function (changed) {
+            // A 200 is cheap evidence that something on screen may be stale, and a misfire is
+            // nearly free: the trajectory carries its own validator, so a tick that finds nothing
+            // changed ends in a 304 without touching a file. A 304 means nothing moved, so there
+            // is nothing to wake for.
+            if (changed) fetchTrajectory(false);
+          });
+        }, SESSION_POLL_INTERVAL);
+        trajectoryPollTimer = window.setInterval(function () {
           if (document.hidden) return;
           // A table that is still being built is not a table this tick may replace. An 全部 window
           // over 18,924 rows takes about 4 s to lay out — longer than this interval — so letting
           // every tick through would restart the build before it reached the end, and the reader
           // would watch the count reset from 3,000 back to 0 forever. The tick is remembered
           // instead, and flushDeferredPoll() runs it once the build finishes.
+          //
+          // This belongs to the trajectory alone. The list never renders the ledger; it rebuilds
+          // an <option> list, and holding it back because the ledger is mid-build was the two
+          // fetches sharing one tick rather than anything the build needs.
           if (ledgerBuilding()) {
             pollDeferred = true;
             return;
           }
-          fetchSessions();
           fetchTrajectory(false);
-        }, POLL_INTERVAL);
+        }, TRAJECTORY_POLL_INTERVAL);
       }
 
       function stopPolling() {
-        if (pollTimer !== null) {
-          window.clearInterval(pollTimer);
-          pollTimer = null;
+        if (sessionPollTimer !== null) {
+          window.clearInterval(sessionPollTimer);
+          sessionPollTimer = null;
+        }
+        if (trajectoryPollTimer !== null) {
+          window.clearInterval(trajectoryPollTimer);
+          trajectoryPollTimer = null;
         }
       }
 
@@ -8726,7 +9441,7 @@
 
         dom.refreshBtn.addEventListener('click', function () {
           announce('正在刷新…');
-          fetchSessions();
+          fetchSessions(true);
           fetchTrajectory(true);
         });
 
@@ -8765,8 +9480,11 @@
           searchTimer = window.setTimeout(function () {
             searchTimer = null;
             state.query = dom.searchInput.value.trim();
+            state.searchError = null;
             resetWindowMode();
-            renderLedger();
+            // The table does not move until the answer arrives; runSearch is what puts the answer
+            // in force, and the count line says 正在搜索 while it is out.
+            runSearch(state.query);
           }, SEARCH_DEBOUNCE);
         });
 

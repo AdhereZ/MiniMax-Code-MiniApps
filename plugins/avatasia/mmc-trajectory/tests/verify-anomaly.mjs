@@ -133,8 +133,14 @@ check('a checkpoint is a compaction',
   pure.recordAnomalyRules({ kind: 'compaction' }, { turn: CLOSED, liveTurn: LIVE }), ['compaction']);
 // A thinking row is the clean case. `{ kind: 'reply' }` is not — a reply with no body is now
 // an anomaly, which is the whole point of the rule below.
+//
+// `hasText: true` is on the fixture and not decoration. The rule tests `hasText === false`
+// strictly, so a record carrying no flag at all is not flagged — deliberate, because a record from
+// an older payload has neither the flag nor the body and must not be called broken. The cost is
+// that a fixture without the flag cannot see a mutation that inverts the KIND test, so the fixture
+// has to look like a real record.
 check('a normal row is not an anomaly',
-  pure.recordAnomalyRules({ kind: 'thinking' }, { turn: CLOSED, liveTurn: LIVE }), []);
+  pure.recordAnomalyRules({ kind: 'thinking', hasText: true }, { turn: CLOSED, liveTurn: LIVE }), []);
 
 check('a turn that never answered, seen from inside it',
   pure.recordAnomalyRules({ kind: 'thinking' }, withLive(BROKEN)), ['noReply']);
@@ -160,8 +166,11 @@ check('two rules can fire on one record',
 // so `closed` is true and 无答复 cannot fire — and the record is still `kind: 'reply'`, so it
 // remains a real reply that the 答复 chip counts. Missing it was a hole in the rule set, not a
 // subtlety: every other rule tests a field that was present, this one tests an absence.
-const SILENT = { kind: 'reply', text: null, summary: '', title: 'assistant', stopReason: 'stop' };
-const SPOKE = { kind: 'reply', text: '答完了。', summary: '答完了。', stopReason: 'stop' };
+// These records carry `hasText`, not `text`. The rule stopped reading the body and reads the
+// server's verdict on it, because the body no longer travels with the row — so a fixture built out
+// of `text` here would be testing a record the server can no longer produce.
+const SILENT = { kind: 'reply', hasText: false, summary: '', title: 'assistant', stopReason: 'stop' };
+const SPOKE = { kind: 'reply', hasText: true, summary: '答完了。', stopReason: 'stop' };
 
 check('a reply with no body is an empty answer',
   pure.recordAnomalyRules(SILENT, { turn: CLOSED, liveTurn: LIVE }), ['silent']);
@@ -183,19 +192,21 @@ check('an empty answer in a closed turn is only the empty answer',
 check('the same record in a turn that never answered fires both',
   pure.recordAnomalyRules(SILENT, withLive(BROKEN)), ['noReply', 'silent']);
 
-// An empty string counts as no body; whitespace does not, because a reader sees something.
-check('an empty string is an empty answer',
-  pure.recordAnomalyRules({ kind: 'reply', text: '' }, { turn: CLOSED, liveTurn: LIVE }), ['silent']);
-check('whitespace is not an empty answer',
-  pure.recordAnomalyRules({ kind: 'reply', text: ' ' }, { turn: CLOSED, liveTurn: LIVE }), []);
+// An empty string counts as no body and whitespace does not — but that is now the server's call,
+// made once when it projected the text, and this only pins that the rule obeys the verdict either
+// way rather than re-deriving it.
+check('a reply the server found empty is an empty answer',
+  pure.recordAnomalyRules({ kind: 'reply', hasText: false }, { turn: CLOSED, liveTurn: LIVE }), ['silent']);
+check('a reply the server found non-empty is not',
+  pure.recordAnomalyRules({ kind: 'reply', hasText: true }, { turn: CLOSED, liveTurn: LIVE }), []);
 // A clipped reply still has a body, however short. textTruncated is not the test.
 check('a clipped reply is not an empty answer',
-  pure.recordAnomalyRules({ kind: 'reply', text: '很长的…', textTruncated: true },
+  pure.recordAnomalyRules({ kind: 'reply', hasText: true, textTruncated: true },
     { turn: CLOSED, liveTurn: LIVE }), []);
 // Only replies. A checkpoint has no body by design and is already its own rule; counting it
 // twice would make the union smaller than the parts, which is the one thing `any` must not be.
 check('a checkpoint is not also an empty answer',
-  pure.recordAnomalyRules({ kind: 'compaction', text: null }, { turn: CLOSED, liveTurn: LIVE }),
+  pure.recordAnomalyRules({ kind: 'compaction', hasText: false }, { turn: CLOSED, liveTurn: LIVE }),
   ['compaction']);
 check('a system record with no body is not an empty answer',
   pure.recordAnomalyRules({ kind: 'system', text: null }, { turn: CLOSED, liveTurn: LIVE }), []);
@@ -445,8 +456,19 @@ page.state.anomaly.rules = ['toolError'];
 check('and while a rule is ticked the search does not narrow the list either',
   page.visibleEntries().length, expect.toolError);
 page.state.anomaly.rules = [];
-assert('but with no rule ticked the search is still a filter for the list',
-  page.visibleEntries().length < page.state.flat.length);
+// This used to set only `query` and expect the list to narrow, which it did because the page
+// scanned the records it already had. The page no longer holds the text, so it narrows by the set
+// the server sent — and `query` with no set in force is a state that now has a name (搜索中) and a
+// consequence, so it is asked about separately rather than quietly assumed away.
+page.state.searchHits = null;
+page.state.searchPending = false;
+assert('but with no answer yet the search does not narrow the list, so an unapplied filter never reads as an applied one',
+  page.visibleEntries().length === page.state.flat.length);
+const answered = new Set(page.state.flat.slice(0, 2).map((entry) => entry.record.index));
+page.state.searchHits = answered;
+assert('and once the server has answered, the search narrows the list',
+  page.visibleEntries().length === answered.size && page.visibleEntries().length < page.state.flat.length);
+page.state.searchHits = null;
 page.state.query = '';
 
 page.state.kinds = pure.KIND_ORDER.filter((k) => k !== 'toolResult');
@@ -917,6 +939,12 @@ const modeSrc = fnSource('function syncAnomalyMode(counts)');
 const baseSrc = fnSource('function resetBaseFilters(');
 assert('the reset updates the buttons, or the axis would show a condition that is not in force',
   !!baseSrc && /state\.kinds = KIND_ORDER\.slice\(\);/.test(baseSrc) && /syncKindButtons\(\);/.test(baseSrc));
+// Clearing the needle but keeping the SERVER'S ANSWER would leave the next query filtering by a
+// set of record indexes from a session the reader has already moved away from. The answer is the
+// state now, so clearing the base axes has to clear it too — and this file is where the reset is
+// already on trial, so the rule is asserted here as well as in the search guard.
+assert('and it drops the search answer with the needle, not just the needle',
+  !!baseSrc && /state\.searchHits = null;/.test(baseSrc) && /state\.searchError = null;/.test(baseSrc));
 // The brush is not written inline here, and it is not written by dropOverviewSelection() either —
 // R5 gave it one writer, so the chain is resetBaseFilters -> dropOverviewSelection ->
 // setOverviewSelection -> the assignment. Following the call and checking the assignment at the far
@@ -925,8 +953,7 @@ assert('the reset updates the buttons, or the axis would show a condition that i
 assert('and it clears every part of the row above, not just the types',
   !!baseSrc && /state\.query = '';/.test(baseSrc) && /dropOverviewSelection\(\);/.test(baseSrc)
   && !!dropSelSource && /setOverviewSelection\(null\);/.test(dropSelSource)
-  && !!setSelSource && /state\.overviewSelection = value;/.test(setSelSource)
-  && /clearTimeRange\(\);/.test(baseSrc));
+  && !!setSelSource && /state\.overviewSelection = value;/.test(setSelSource)  && /clearTimeRange\(\);/.test(baseSrc));
 const toggleFull = fnSource('function onAnomalyToggle(');
 assert('and it runs on every tick into the mode, not only the first',
   !!toggleFull && /if \(next\.length > 0\) resetBaseFilters\(\);/.test(toggleFull));
@@ -978,8 +1005,12 @@ assert('with the rule name, not a bare colour', /anomalyRuleLabel\(turnFlags\[fl
 // pill — it is a reply — but with no body the marker is the only thing telling the reader this
 // is not an answer, and the duration cell is where 失败 already took one.
 const rowSrc = fnSource('function buildRow(');
+// `isNil(record.text)` used to be this. The body does not travel with the row any more, so the row
+// reads the server's verdict instead — and reads it strictly (`=== false`), because a record from a
+// payload that predates the flag has neither `hasText` nor a body, and treating that as "has a body"
+// would draw a marker on a record the server never said anything about.
 assert('an empty reply is marked on its row',
-  /record\.kind === 'reply' && isNil\(record\.text\)/.test(rowSrc));
+  /record\.kind === 'reply' && record\.hasText === false/.test(rowSrc));
 assert('and it reuses the duration cell instead of adding a column',
   /else if \(silent\) \{[\s\S]*?anomalyRuleLabel\('silent'\)[\s\S]*?\} else \{/.test(rowSrc));
 assert('the row names the rule from the table, not from a label written here',

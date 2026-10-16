@@ -36,10 +36,27 @@ PROBE = os.path.join(HERE, "verify-list-cache.mjs")
 # once at startup and restored byte for byte in the same `finally` that already covered the server.
 MUTATIONS = [
     # The defect verbatim: the cache is shorter than the interval that expires it, so it is never
-    # hit. Not a slow cache — a cache that cannot be reached.
+    # hit. Not a slow cache — a cache that cannot be reached. Measured against the LIST's cadence
+    # rather than the page's, which is the one that actually calls this route.
     ("the list TTL drops below the poll interval",
      [("const LIST_CACHE_TTL_MS = 3000;", "const LIST_CACHE_TTL_MS = 1000;")],
-     "is at or above POLL_INTERVAL"),
+     "is at or above the list poll interval"),
+
+    # The other direction, and the one a 304 depends on. If the descriptor cache expires sooner
+    # than the walk that feeds the validator, the tag is built from facts newer than the entries
+    # it stands for, and a stale descriptor can be pinned in place by a tag that says nothing
+    # changed. Raising the walk's TTL is the cheapest way in, because it never trips the rule
+    # above on its own.
+    ("the descriptor cache expires sooner than the walk that feeds the validator",
+     [("const SESSION_CACHE_TTL_MS = 5000;", "const SESSION_CACHE_TTL_MS = 2000;")],
+     "is at or below SESSION_CACHE_TTL_MS"),
+
+    # The list body cache is a third thing the poll built, and it holds serialized bytes this
+    # time. Small next to the other two, which is exactly why it is the one that gets forgotten —
+    # the parsed-row cache leaked here once for the same reason.
+    ("dispose stops releasing the list body cache",
+     [("    sessionsBody = { material: '', body: null };\n", "")],
+     "dispose releases the list body cache"),
 
     # The quieter cousin: the label and counters come from a prefix of messages.jsonl, and a
     # generation marker lives on the first row. Reading far past it costs a full page of I/O on
@@ -64,8 +81,9 @@ MUTATIONS = [
     # The parsed-row cache leaked here once — a disposed runtime held ~43 MB for a 39 MB session —
     # and the line that fixed it is in server.mjs precisely so the next cache cannot repeat it.
     ("dispose stops releasing the title cache",
-     [("titleCache = { at: 0, key: '', map: new Map() };\n    descriptorCache.clear();",
-       "descriptorCache.clear();")],
+     [("    listCache = { at: 0, candidates: null };\n"
+       "    titleCache = { at: 0, key: '', map: new Map() };\n",
+       "    listCache = { at: 0, candidates: null };\n")],
      "dispose releases the title cache"),
 
     # ---- D45: a prefix count is not a count. ----
@@ -113,6 +131,63 @@ MUTATIONS = [
      [("        var tail = isCount(count) ? '（' + when + ' · ' + formatInt(count) + ' 条）' : '（' + when + '）';",
        "        var tail = '（' + when + ' · ' + formatInt(count) + ' 条）';")],
      "the session picker omits the count segment instead of printing a placeholder",
+     CLIENT),
+
+    # ---- the branch a session was spawned from -------------------------------------------
+    # Four links between the store's parent column and the mark on the option, and dropping any
+    # one of them produces the SAME silent list: a sub-agent run listed exactly like a top-level
+    # conversation, with no error and no number moved. So they are four separate mutations rather
+    # than one, because a single one would pass as long as the guard happened to watch that link
+    # and not the three that were actually cut.
+    ("the titles query stops reading the parent column",
+     [("select session_id, title, session_kind, parent_session_id from local_runtime_sessions where session_id = ?",
+       "select session_id, title, session_kind from local_runtime_sessions where session_id = ?")],
+     "the titles query reads the parent column"),
+
+    # The one the acceptance review named, and the only one in this file that is invisible to every
+    # regex above it. Those regexes are all satisfied by a query that WORKS; none is satisfied by a
+    # query that fails, which is the whole case — `db.prepare` throws on a column the database does
+    # not have, the throw lands in the empty catch that exists for a different reason, and every
+    # title and every kind in the page reverts to the first sentence of the transcript. With the
+    # fallback gone the query text is exactly the text the guard requires, so the whole section
+    # above still passes and the page is simply broken on every database written before child
+    # sessions existed. The assertion that catches it is the one that builds such a database here.
+    ("a database without the parent column loses every title and kind, not just the parent",
+     [("""    let stmt;
+    try {
+      stmt = db.prepare('select session_id, title, session_kind, parent_session_id from local_runtime_sessions where session_id = ?');
+    } catch {
+      try {
+        stmt = db.prepare('select session_id, title, session_kind from local_runtime_sessions where session_id = ?');
+      } catch {
+        return result;
+      }
+    }
+""", "    const stmt = db.prepare('select session_id, title, session_kind, parent_session_id from local_runtime_sessions where session_id = ?');")],
+     "a database WITHOUT the column keeps the title and the kind, and only loses the parent"),
+
+    ("the parent row is read but never mapped",
+     [("        parent: typeof row.parent_session_id === 'string' && row.parent_session_id !== ''\n"
+       "          ? row.parent_session_id\n"
+       "          : null,\n", "")],
+     'the parent row is mapped, and an empty id is no parent rather than a parent named ""'),
+
+    ("the descriptor is built without the parent",
+     [("            descriptor.sessionParentId = meta.parent;", "")],
+     "the descriptor carries the parent onto the row the page receives"),
+
+    # This one is the most likely to be reintroduced by accident: it is a whole-field removal in
+    # a function whose job is to decide what may leave the service, and nothing else in it fails.
+    ("the field is stripped before it is sent",
+     [("    sessionParentId: value.sessionParentId ?? null,", "")],
+     "the field survives the strip, with null as the floor"),
+
+    # The direction that looks right and is not: marking every row. Every string the guard looks
+    # for is still present, and the list reads as though every conversation were a sub-agent run.
+    ("the mark is applied to every session rather than the branches",
+     [("        var branch = session && session.sessionParentId ? BRANCH_MARK : '';",
+       "        var branch = BRANCH_MARK;")],
+     "the page decides the marker by the field and not unconditionally",
      CLIENT),
 ]
 

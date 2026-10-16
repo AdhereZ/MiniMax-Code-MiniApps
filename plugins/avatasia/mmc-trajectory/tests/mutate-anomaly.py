@@ -70,8 +70,8 @@ CASES = [
     # case honest: if passesBaseFilter stopped applying the query, the list would stop being
     # filtered at all and the exclusivity check above it would pass for the wrong reason.
     ("the base filter stops applying the query",
-     "but with no rule ticked the search is still a filter for the list",
-     "        if (state.query && !matchesQuery(record, state.query)) return false;",
+     "and once the server has answered, the search narrows the list",
+     "        if (state.query && !matchesQuery(record, state.query, state.searchHits)) return false;",
      "        if (false && state.query) return false;"),
     # Dropping the range from passesBaseFilter is deliberately NOT here: that guard lives in
     # verify-time-range.mjs, and a case listed against a probe that does not own it would be
@@ -183,7 +183,7 @@ CASES = [
     # Anchored with the signature above it: `if (state.anomaly.rules.length > 0)` appears twice
     # — once in recordVisible(), once in applyFilterScope() — and the two mean nothing alike.
     ("the mode is read backwards, so the search stops filtering at all",
-     "but with no rule ticked the search is still a filter for the list",
+     "and once the server has answered, the search narrows the list",
      "      function recordVisible(record, turn, selection) {\n        if (state.anomaly.rules.length > 0) {",
      "      function recordVisible(record, turn, selection) {\n        if (state.anomaly.rules.length >= 0) {"),
     ("the two axes stacked instead of alternated",
@@ -229,9 +229,10 @@ CASES = [
      "ticking a rule puts every type back",
      "        if (next.length > 0) resetBaseFilters();",
      "        if (next.length > 0 && false) resetBaseFilters();"),
-    ("the reset forgets the search box", "and drops the search",
-     "        state.query = '';\n        dropOverviewSelection();",
-     "        dropOverviewSelection();"),
+    ("the reset forgets the search box",
+     "and it drops the search answer with the needle, not just the needle",
+     "        state.query = '';\n        state.searchHits = null;",
+     "        state.query = '';"),
     # Distinct from the one above, and it was missing until a cross-check read the names rather
     # than the diffs: that mutation deletes `state.query`, not `dom.searchInput.value`. The box
     # is cleared by its own line, and with `dom.searchInput` nulled in the sandbox that line had
@@ -366,33 +367,42 @@ CASES = [
     # --- 空答复: a reply the runtime finished and then delivered nothing into.
     # Every other rule tests a field that was there. This one tests an absence, so most of the
     # ways to get it wrong are over-matching rather than under-matching.
+    #
+    # The absence it tests is `hasText === false` and not `isNil(record.text)` any more: the body
+    # does not travel with the row, so the rule reads the server's verdict on it. The shape of the
+    # trap is unchanged — a strict `=== false` is what keeps a record from an older payload, which
+    # has neither flag nor body, from being called an anomaly.
     ("an empty answer rule that ignores the body", "a reply that said something is not",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
      "            return !!record && record.kind === 'reply';"),
     ("the no-body test inverted, so every spoken reply becomes an anomaly",
      "a reply with no body is an empty answer",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
-     "            return !!record && record.kind === 'reply' && !isNil(record.text);"),
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
+     "            return !!record && record.kind === 'reply' && record.hasText === true;"),
+    # The expected name is the checkpoint assertion, not "a normal row is not an anomaly". A row
+    # with a body cannot fire this rule whichever way the KIND test is written, so that assertion
+    # has nothing to say about an inversion here; the record that does is a non-reply WITHOUT a
+    # body, and the fixture that owns "a non-reply is not an empty answer" is the checkpoint one.
     ("the kind test inverted, so every non-reply is an empty answer",
-     "a normal row is not an anomaly",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
-     "            return !!record && record.kind !== 'reply' && isNil(record.text);"),
+     "a checkpoint is not also an empty answer",
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
+     "            return !!record && record.kind !== 'reply' && record.hasText === false;"),
     # Dropping the body and reading truncation instead hits the plain no-body case first, on a
     # record that carries no truncation flag at all. That assertion is the one that owns it.
     ("no-body judged by truncation instead of by absence", "a reply with no body is an empty answer",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
      "            return !!record && record.kind === 'reply' && record.textTruncated === false;"),
     ("a checkpoint counted twice, once as a checkpoint and once as an empty answer",
      "a checkpoint is not also an empty answer",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
-     "            return !!record && isNil(record.text);"),
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
+     "            return !!record && record.hasText === false;"),
     ("the empty-answer rule never fires", "empty answer count matches the payload",
-     "            return !!record && record.kind === 'reply' && isNil(record.text);",
+     "            return !!record && record.kind === 'reply' && record.hasText === false;",
      "            return false;"),
 
     # --- and the row, because a filter that shows these without marking them shows nothing
     ("the empty-answer marker removed from the row", "an empty reply is marked on its row",
-     "        var silent = record.kind === 'reply' && isNil(record.text);",
+     "        var silent = record.kind === 'reply' && record.hasText === false;",
      "        var silent = false;"),
     ("the row's marker branch dropped, leaving the duration cell instead",
      "and it reuses the duration cell instead of adding a column",

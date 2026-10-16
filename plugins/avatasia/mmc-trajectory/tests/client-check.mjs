@@ -61,9 +61,6 @@ check('duration NaN', sandbox.formatDuration(NaN), '—');
 check('int null', sandbox.formatInt(null), '—');
 check('int group', sandbox.formatInt(1234567), '1,234,567');
 check('int zero', sandbox.formatInt(0), '0');
-check('compact null', sandbox.formatCompact(null), '—');
-check('compact 12500', sandbox.formatCompact(12500), '12.5k');
-check('compact 2500000', sandbox.formatCompact(2500000), '2.5M');
 check('offset null', sandbox.formatOffset(null), '—');
 check('offset 887', sandbox.formatOffset(887), '+887 ms');
 check('offset 12000', sandbox.formatOffset(12000), '+12 s');
@@ -102,11 +99,13 @@ check('kindLabel ignores title', sandbox.kindLabel({ kind: 'system', title: 'com
 check('every kind has a label', sandbox.KIND_ORDER.every((k) => typeof sandbox.KIND_LABELS[k] === 'string' && sandbox.KIND_LABELS[k].length > 0), true);
 check('every label has a kind', Object.keys(sandbox.KIND_LABELS).every((k) => sandbox.KIND_ORDER.indexOf(k) >= 0), true);
 
-/* generation selector — one generation is not a choice, and the newest comes first */
+/* generation selector — one generation is not a choice, and the newest comes first.
+   `logicalMessageCount` is how many logical messages that generation stores; the catalog's
+   `messageCount` counts stored rows, and a message the store wrote twice is one message. */
 const gens = [
-  { generation: 0, kind: 'snapshot', messageCount: 676, active: false },
-  { generation: 1, kind: 'snapshot', messageCount: 548, active: false },
-  { generation: 2, kind: 'active', messageCount: 186, active: true }
+  { generation: 0, kind: 'snapshot', messageCount: 676, logicalMessageCount: 610, active: false },
+  { generation: 1, kind: 'snapshot', messageCount: 548, logicalMessageCount: 494, active: false },
+  { generation: 2, kind: 'active', messageCount: 186, logicalMessageCount: 180, active: true }
 ];
 check('generationOptions empty for one', sandbox.generationOptions([{ generation: 0 }], 0), []);
 check('generationOptions empty for none', sandbox.generationOptions([], null), []);
@@ -119,7 +118,16 @@ check('generationOptions all is never marked active', opts[0].active, false);
 check('generationOptions newest generation first', opts[1].generation, 2);
 check('generationOptions active marked', opts[1].active, true);
 check('generationOptions active label', opts[1].label, '第 2 代（当前）');
-check('generationOptions archived label carries count', opts[2].label, '第 1 代（548 条）');
+check('generationOptions archived label carries the stored count', opts[2].label, '第 1 代（494 条）');
+check('generationOptions exposes that count to the option', opts[2].messageCount, 494);
+check(
+  'generationOptions prefers the stored count over the catalog row count',
+  sandbox.generationOptions([
+    { generation: 0, messageCount: 676, logicalMessageCount: 610 },
+    { generation: 1, messageCount: 548, logicalMessageCount: 494 }
+  ], 1)[2].label,
+  '第 0 代（610 条）'
+);
 check('generationOptions last option', opts[3].generation, 0);
 check(
   'generationOptions drops entries without a generation',
@@ -129,7 +137,7 @@ check(
 check('generationOptions falls back to the active flag', sandbox.generationOptions(gens, null)[1].active, true);
 check(
   'generationOptions missing count drops the suffix',
-  sandbox.generationOptions([{ generation: 0, messageCount: null }, { generation: 1, messageCount: 5, active: true }], 1)[2].label,
+  sandbox.generationOptions([{ generation: 0, logicalMessageCount: null }, { generation: 1, messageCount: 5, logicalMessageCount: 5, active: true }], 1)[2].label,
   '第 0 代'
 );
 
@@ -151,22 +159,119 @@ assert('jsonColorize colors numbers', colored.includes('tok-num'));
 check('jsonColorize undefined', sandbox.jsonColorize(undefined), '');
 check('jsonColorize null', sandbox.jsonColorize(null), '<span class="tok-null">null</span>');
 
-/* search: case-insensitive over summary + text + result + thinking, hostile content */
+/* search: the server says which records match, and the page asks a set */
 const hostile = {
+  index: 41,
   kind: 'reply',
   summary: 'Ask about <script>alert(1)</script>',
   text: 'Answering now',
   result: null,
   thinking: null
 };
-check('match lowercase', sandbox.matchesQuery(hostile, 'script'), true);
-check('match uppercase', sandbox.matchesQuery(hostile, 'ALERT'), true);
-check('match miss', sandbox.matchesQuery(hostile, 'zzz'), false);
-check('match empty query', sandbox.matchesQuery(hostile, ''), true);
-check('match result field', sandbox.matchesQuery({ kind: 'toolResult', result: { code: 'ENOENT' } }, 'enoent'), true);
-check('match thinking object', sandbox.matchesQuery({ kind: 'thinking', thinking: { text: 'chain of thought' } }, 'thought'), true);
-check('match null thinking safe', sandbox.matchesQuery({ kind: 'thinking', thinking: null }, 'thought'), false);
+// The five fields are no longer scanned here — that is the whole point of the move — so what is
+// held is a set of record indexes and the record's own content is irrelevant to the decision.
+const hit41 = sandbox.searchHitSet([{ index: 41 }, { index: 7 }]);
+check('the hit set holds the server\'s indexes', Array.from(hit41).sort((a, b) => a - b), [7, 41]);
+check('a record the server named passes whatever the needle says', sandbox.matchesQuery(hostile, 'script', hit41), true);
+check('a record whose text contains the needle but which the server did not name fails',
+  sandbox.matchesQuery(hostile, 'script', sandbox.searchHitSet([{ index: 7 }])), false);
+check('an unmatched needle matches nothing', sandbox.matchesQuery(hostile, 'zzz', sandbox.searchHitSet([])), false);
+check('an empty query filters nothing', sandbox.matchesQuery(hostile, '', hit41), true);
+check('an unanswered needle filters nothing, and says so elsewhere', sandbox.matchesQuery(hostile, 'zzz', null), true);
+check('an unanswered needle is not an empty result', sandbox.searchHitSet(null), null);
+check('a real empty result is an empty set', sandbox.searchHitSet([]).size, 0);
+check('a hit without an index is dropped rather than becoming one', sandbox.searchHitSet([{ index: 'x' }, { index: 3 }]).size, 1);
+check('a null hit is dropped', sandbox.searchHitSet([null, { index: 3 }]).size, 1);
+check('a record with no index cannot be in the set',
+  sandbox.matchesQuery({ kind: 'user' }, 'x', sandbox.searchHitSet([{ index: 1 }])), false);
+check('a missing record does not throw',
+  sandbox.matchesQuery(null, 'x', sandbox.searchHitSet([{ index: 1 }])), false);
+
+/* search: the four states the count line has to tell apart */
+const status = (over) => sandbox.searchStatusLabel(Object.assign(
+  { query: 'abc', searchError: null, searchPending: false, searchHits: new Set([1]), searchTotal: 3, searchTruncated: false },
+  over,
+));
+check('no needle, no status', sandbox.searchStatusLabel({ query: '', searchTotal: 0 }), '');
+check('a needle answered with hits', status({}), '命中 3 条');
+check('a needle answered with nothing', status({ searchHits: new Set(), searchTotal: 0 }), '未找到');
+check('a needle still out', status({ searchPending: true }), '搜索中');
+check('a needle that failed says so rather than showing an empty table',
+  status({ searchError: 'search_failed' }), '搜索失败，以下为上次结果');
+check('a failure outranks 「searching」, because it is the truth about the request',
+  status({ searchPending: true, searchError: 'search_failed' }), '搜索失败，以下为上次结果');
+check('an unanswered needle is not 「未找到」',
+  status({ searchHits: null, searchTotal: 0, searchPending: false }), '命中 0 条');
+check('a truncated answer says so', status({ searchTruncated: true }), '命中 3 条（已截断）');
+check('a needle answered with nothing and truncated reads as not found',
+  status({ searchHits: new Set(), searchTotal: 0, searchTruncated: true }), '未找到');
+check('no state is not a crash', sandbox.searchStatusLabel(null), '');
 check('no kinds match', sandbox.hasKind({ kind: 'system' }, ['user']), false);
+
+/* search: the TRANSITION, which the four states above cannot see.
+ *
+ * Every case in the block above hands `searchStatusLabel` a state object written out for that one
+ * case, and the `runSearch` checks further down read its source as text. Both are blind to the same
+ * thing: a state is a snapshot, so neither can see that a search which failed once and was then
+ * re-run and answered still said 「搜索失败，以下为上次结果」 — the label reads the error first, so
+ * the stale error outranked the fresh hit set it was describing. Only the two paths a READER
+ * triggers cleared the field: typing, and pressing clear. A poll that re-runs the current query
+ * after the transcript changed is not a reader, so nothing it did could clear it.
+ *
+ * This runs it instead of reading it. `runSearch` is not between PURE:START and PURE:END — it
+ * talks to the network — so it could not join the sandbox above; here the SHIPPED source of the
+ * functions it needs is sliced out by `fnSource` and evaluated. That is the page's own text rather
+ * than a copy of it: rename a function in index.html and this fails with "no such function" instead
+ * of quietly continuing to exercise the old shape. */
+{
+  const netCtx = { console, AbortController, setTimeout, clearTimeout, encodeURIComponent };
+  vm.createContext(netCtx);
+  const needed = ['function isCount(value)', 'function formatInt(value)', 'function searchHitSet(hits)',
+    'function sessionParam()', 'function searchStatusLabel(searchState)', 'function runSearch(needle)'];
+  const sources = needed.map((sig) => fnSource(sig));
+  check('the shipped search functions are all still findable by signature',
+    needed.filter((sig, i) => !sources[i]), []);
+
+  vm.runInContext([
+    // The shape `runSearch` writes into. Every field it touches is here; nothing else about the
+    // page's state is, because nothing else about the page's state is what is under test.
+    'var state = { query: "retry me", sessionId: null, hostSessionId: null, followLatest: true,',
+    '  generation: null, searchHits: null, searchTotal: 0, searchTruncated: false,',
+    '  searchPending: false, searchError: null };',
+    'var searchSeq = 0;',
+    'var searchController = null;',
+    // The two renderers paint the page; neither is what is being tested and neither has a DOM here.
+    'function resetWindowMode() {}',
+    'function renderLedger() {}',
+    // A signature that no longer resolves becomes a function that throws when reached, so the
+    // failure names the function rather than arriving as a syntax error nobody can read.
+    ...sources.map((src, i) => src || (needed[i] + ' { throw new Error(' + JSON.stringify(needed[i])
+      + ' is not in index.html any more); }')),
+  ].join('\n'), netCtx);
+
+  const settle = async () => {
+    // fetch -> response.json() -> then -> then -> then is all microtasks plus the json() promise.
+    // Three macrotask turns drain all of them, so the count does not have to be right.
+    for (let i = 0; i < 3; i += 1) await new Promise((done) => setImmediate(done));
+  };
+
+  netCtx.fetch = () => Promise.reject(Object.assign(new Error('api'), { code: 'search_failed' }));
+  netCtx.runSearch('retry me');
+  await settle();
+  const afterFailure = netCtx.searchStatusLabel(netCtx.state);
+
+  netCtx.fetch = () => Promise.resolve({ ok: true, status: 200,
+    json: () => Promise.resolve({ hits: [{ index: 7 }], total: 1, truncated: false }) });
+  netCtx.runSearch('retry me');
+  await settle();
+
+  check('a search that failed says so', afterFailure, '搜索失败，以下为上次结果');
+  check('and the retry that answers it clears the failure, not just the pending flag',
+    netCtx.state.searchError, null);
+  check('so the label reports the answer instead of the stale failure',
+    netCtx.searchStatusLabel(netCtx.state), '命中 1 条');
+  check('and the hit set it describes is the new one', [...netCtx.state.searchHits], [7]);
+}
 
 /* flatten + signature */
 check('flatten empty', sandbox.flattenTurns(undefined), []);
@@ -184,14 +289,18 @@ assert('signature changes with counts', sigA !== sandbox.signatureOf(payload));
 
 /* handoff markdown */
 const turn = { id: 't1', index: 3 };
+// No `error` field any more: it was the same string as `result`, set only when `isError` was already
+// true, and it no longer rides along on the row at all. The message comes from the record-detail
+// read and is passed in, so the fixture passes it in too.
 const failing = {
   kind: 'toolCall', index: 42, toolName: 'read', toolCallId: 'call_bb89',
   timestamp: 1791603931971, relativeMs: 887, durationMs: null, isError: true,
-  error: 'boom <b>x</b>', model: 'MiniMax-M3.1-Flash-Preview', provider: 'minimax',
+  model: 'MiniMax-M3.1-Flash-Preview', provider: 'minimax',
   api: 'anthropic-messages', stopReason: 'toolUse', textTruncated: true,
   tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
   arguments: { path: 'a.txt' }
 };
+const ERROR_TEXT = 'boom <b>x</b>';
 const raw = sandbox.truncateJson({ blob: 'x'.repeat(20000) }, sandbox.HANDOFF_RAW_LIMIT);
 check('truncateJson caps at 8000', raw.text.length, 8000);
 check('truncateJson flags', raw.truncated, true);
@@ -201,13 +310,18 @@ check('truncateJson small', sandbox.truncateJson({ a: 1 }, 8000).truncated, fals
 // tests/verify-raw-lazy.mjs).
 // The markdown therefore takes the verdict as its own argument, and this asserts that a
 // caller who passes it still gets the line — and that one who does not, gets silence.
-const md = sandbox.buildHandoffMarkdown({ id: 'mvs_1', label: '测试会话' }, turn, failing, raw.text, raw.truncated, true);
-const mdWithoutVerdict = sandbox.buildHandoffMarkdown({ id: 'mvs_1', label: '测试会话' }, turn, failing, raw.text, raw.truncated);
+const md = sandbox.buildHandoffMarkdown({ id: 'mvs_1', label: '测试会话' }, turn, failing, raw.text, raw.truncated, true, ERROR_TEXT);
+const mdWithoutVerdict = sandbox.buildHandoffMarkdown({ id: 'mvs_1', label: '测试会话' }, turn, failing, raw.text, raw.truncated, undefined, ERROR_TEXT);
 assert('md omits the flag when no verdict was passed', !mdWithoutVerdict.includes('原文过大已被省略'));
 assert('md locates turn', md.includes('第 3 轮'));
 assert('md locates record', md.includes('#42'));
 assert('md names kind', md.includes('工具调用'));
-assert('md marks failure', md.includes('状态：失败') && md.includes('boom <b>x</b>'));
+assert('md marks failure', md.includes('状态：失败') && md.includes(ERROR_TEXT));
+// The detail read is allowed to fail on its own so the report still goes out. Saying so beats a
+// line reading 「失败」 with nothing after it, which reads as "the tool said nothing".
+const mdWithoutError = sandbox.buildHandoffMarkdown({ id: 'mvs_1', label: '测试会话' }, turn, failing, raw.text, raw.truncated, true);
+assert('md still reports the failure when the error text did not arrive', mdWithoutError.includes('状态：失败'));
+assert('and says the text is missing rather than printing an empty value', mdWithoutError.includes('（错误信息未能读取）'));
 assert('md renders null duration as dash', md.includes('耗时：—'));
 assert('md notes truncation', md.includes('已截断到 8000 字符'));
 assert('md notes flags', md.includes('原文过大已被省略') && md.includes('正文已被上游截断'));
@@ -284,20 +398,114 @@ for (const selector of ['.tbtn', '.tbtn-icon', '.overview-plot', '.ov-span', '.w
   assert('css rule survives comment stripping: ' + selector, styleNoComments.includes(selector + ' {') || styleNoComments.includes(selector + ','));
 }
 
-// turnContext builds its string from turnContextParts, and turnContextSuffix calls
-// turnContext, so a check that wants to RUN any of them has to lift all three, in dependency
-// order. Lifting by regex is acceptable here because these are leaf functions ending in a
-// single `}` at a fixed indent; the alternative — moving them into the PURE block — would put
-// UI string helpers in the unit-tested core for no unit test's benefit.
+// The generation banner describes a context the reader chose out of a lineage. Whether that
+// generation is still growing is the difference between a promise and a description, and the
+// picker can pin the LIVE one — so promising immutability for whichever generation was picked is
+// the wrong sentence half the time. The wording is only reachable through the DOM, so it is
+// checked here against the delivered file rather than through the sandbox.
+assert('the generation banner names both states, not just the sealed one',
+  html.includes('当时封存的快照') && html.includes('仍在随后续对话更新'));
+assert('...and reads which one applies from the active generation',
+  /var live = [^;]*session\.activeGeneration === shown;/.test(html));
+
+// 「全部上下文共 N 条」 is the comparison the reader is there for. Taking it from the generation
+// on screen leaves the sentence true and useless, so it has to read the session total — which is
+// the logical message count, not the rows the catalog counted per file.
+const statsAllBody = fnSource('function statsAll()') || '';
+assert('the whole-context count reads the session total', statsAllBody.includes('stats.messagesAll'));
+
+/* ---------- the row key, and the one place selection is per message ---------- */
+// One message can expand into several rows. Anything that has to name ONE row has to use the
+// row's own key; selection is the deliberate exception, and that exception is the feature.
+const keySrc = fnSource('function recordKey(record)') || '';
+assert('the row key prefers the row index over the message id',
+  /isCount\(record\.index\)\)\s*return String\(record\.index\)/.test(keySrc));
+const rowSrc = fnSource('function buildRow(entry, rail)') || '';
+assert('a ledger row is keyed by its own row, not by its message',
+  /setAttribute\('data-row-id', recordKey\(record\)\)/.test(rowSrc));
+assert('...while clicking a row still selects the message it belongs to',
+  /selectRecord\(record\.id\)/.test(rowSrc) && /aria-current/.test(rowSrc));
+assert('the scroll anchor reads that key back out of the DOM',
+  /querySelector\('\[data-row-id="'/.test(html));
+
+// The overview had one id doing two jobs. A hover needs the row's key to mark one span; a click
+// needs the message's id. Returning the key forced both onto one number.
+const spanSrc = fnSource('function overviewModel(entries)') || '';
+assert('an overview span is keyed by its row, not by its message', /id: recordKey\(record\)/.test(spanSrc));
+const selSrc = fnSource('function recordInSelection(record, selection, spansById)') || '';
+assert('the time brush looks a span up by the row key too',
+  /spansById\.get\(recordKey\(record\)\)/.test(selSrc));
+const spanAtSrc = fnSource('function spanAt(clientX, clientY)') || '';
+// The hit test has to hand back a SPAN. It used to read the record id off the DOM node under the
+// pointer, and that is what forced click and hover onto one number; it now resolves through the
+// model instead, which returns the span. Asserting the *shape* of the answer rather than the line
+// that produced it is what lets the resolution move without the requirement moving with it.
+//
+// This is NOT the whole property, and the two rejections below are not an exhaustive account of it.
+// They catch the two spellings that have actually shipped here — resolving through the DOM, and
+// returning `.record.id` directly — and a second acceptance review found a third that walks past
+// both: `recordKey(hit.record)` and `hit.id` both return a key, keep the model resolution, and read
+// clean. Enumerating return values as syntax does not terminate. `verify-overview.mjs` owns the
+// property itself: it runs `spanAt` and asks what came back, because every key-returning shape
+// answers a string and a span is not one.
+assert('the hit test returns the span, so click and hover stop sharing one number',
+  /nearestSpanAt\(/.test(spanAtSrc)
+  && !/getAttribute\('data-record-id'\)/.test(spanAtSrc)
+  && !/\.record\.(id|index)\b/.test(spanAtSrc));
+const nearestSrc = fnSource('function nearestSpanAt(time, lane)') || '';
+assert('...and so does the nearest-span lookup', /best = span;/.test(nearestSrc) && !/best = span\.id;/.test(nearestSrc));
+const pointerUp = fnSource('function onOverviewPointerUp(event)') || '';
+assert('clicking a span selects the message, not the row',
+  /selectRecord\(span\.record\.id\)/.test(pointerUp) && /selectRecord\(nearest\.record\.id\)/.test(pointerUp));
+assert('hovering a span marks only that span',
+  /var id = hovered \? hovered\.id : null;/.test(html));
+
+// turnSubNode is the one presenter of the line under 对话轮次. It used to have a dead
+// sibling: turnContextSuffix() built the same string, had no caller outside this file, and
+// these two checks ran against it. That was the wrong subject — a check that exercises a
+// presenter nothing renders passes while the rendered line is broken, which is the very defect
+// the checks exist to catch.
+//
+// So they run turnSubNode now, and really run it: `el` and `document.createTextNode` are
+// stubbed below and the rendered text is read back off the tree. Reading its source with a
+// regex is the pattern two checks further down, and it is weaker — the invariant is about the
+// characters the reader receives, not about a substring surviving an edit.
 function fnSource(signature) {
   const m = html.match(new RegExp(signature.replace(/[()]/g, '\\$&') + ' \\{[\\s\\S]*?\\n {6}\\}'));
   return m ? m[0] : null;
 }
+function stubNode(tag, text) {
+  return {
+    tag,
+    textContent: text === undefined || text === null ? '' : String(text),
+    className: '',
+    children: [],
+    setAttribute: () => {},
+    addEventListener: () => {},
+    appendChild(n) { this.children.push(n); return n; }
+  };
+}
+function textOf(node) {
+  return node.children.length ? node.children.map(textOf).join('') : node.textContent;
+}
 function liftTurnFns() {
+  // The stubs go in before the lift: turnSubNode reads state and KIND_LABELS at render time
+  // and builds its tree through el() and document.createTextNode(), none of which the PURE
+  // sandbox has. Installing them after would leave the lift failing for a reason that has
+  // nothing to do with what is under test.
+  sandbox.el = (tag, className, text) => {
+    const n = stubNode(tag, text);
+    if (className) n.className = className;
+    return n;
+  };
+  sandbox.document = { createTextNode: (t) => stubNode('#text', t) };
+  sandbox.state = { kinds: ['steer', 'compaction'] };
+  sandbox.KIND_LABELS = { steer: '追加', compaction: '压缩' };
+  sandbox.onKindToggle = () => {};
   for (const name of [
     'function turnContextParts(stats)',
-    'function turnContext(stats)',
-    'function turnContextSuffix(stats)',
+    'function turnBreakdown(stats)',
+    'function turnSubNode(stats)'
   ]) {
     const src = fnSource(name);
     if (!src) return false;
@@ -319,6 +527,49 @@ const codeOnly = html
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .replace(/^[ \t]*\/\/.*$/gm, '');
 
+/* ------------------------------------------------------------------ session picker: branch marker */
+// A session that the runtime spawned from another one used to be listed exactly like a top-level
+// conversation, because nothing in the list said otherwise: the parent column existed in the store
+// and was never read, and the one field that did reach the page (`sessionKind`) had no reader in
+// it at all. A reader comparing two entries could not tell a sub-agent run from a conversation.
+//
+// The marker is checked here by RUNNING it rather than by matching its text, because the failure
+// worth catching is not a typo in the string — it is the marker being applied to everything, or to
+// nothing, and both of those still contain the right characters. The decisive case is the third
+// one: two sessions identical except for `sessionParentId`, whose labels must differ by exactly
+// the marker and nothing else. A version that appended the marker unconditionally passes every
+// "does it contain 子会话" check and fails this one.
+const branchMarkSrc = /var BRANCH_MARK = '[^']*';/.exec(html);
+const branchLabelSrc = fnSource('function sessionOptionLabel(session, now)');
+if (!branchMarkSrc || !branchLabelSrc) {
+  failures.push('session picker: could not lift sessionOptionLabel / BRANCH_MARK');
+} else {
+  vm.runInContext(branchMarkSrc[0] + '\n' + branchLabelSrc, sandbox);
+  const NOW = 1_800_000_000_000;
+  const base = { label: '一个会话', lastActiveAt: NOW - 60_000, messageCount: 42 };
+  const plain = sandbox.sessionOptionLabel({ ...base }, NOW);
+  const branch = sandbox.sessionOptionLabel({ ...base, sessionParentId: 'mvs_parent' }, NOW);
+
+  assert('a top-level session is not marked as a branch',
+    plain.indexOf('子会话') < 0);
+  assert('a session the runtime spawned is marked as one',
+    branch.indexOf('子会话') >= 0);
+  // Identity, not shape: the only thing that differs between these two inputs is the field, so
+  // the only thing allowed to differ between the two labels is the marker.
+  assert('the marker is driven by the field, not by where the row sits in the list',
+    branch.replace(' · 子会话', '') === plain);
+  assert('and nothing else about the label changes with it',
+    branch.length === plain.length + ' · 子会话'.length);
+  // An empty parent string is "no parent", not "a parent named the empty string".
+  assert('an empty parent id is not a parent',
+    sandbox.sessionOptionLabel({ ...base, sessionParentId: '' }, NOW) === plain);
+  // The unnamed branch takes the marker too — otherwise the one case with no title to read is
+  // the one case a reader cannot place.
+  assert('an unnamed branch is still marked',
+    sandbox.sessionOptionLabel({ lastActiveAt: NOW - 60_000, messageCount: 42,
+      sessionParentId: 'mvs_parent' }, NOW).indexOf('子会话') >= 0);
+}
+
 const checks = [
   ['no remote http(s) resource', !/<(script|link|img|iframe)[^>]+(src|href)=["']https?:/i.test(html)],
   ['no @import', !/@import/.test(html)],
@@ -333,7 +584,16 @@ const checks = [
   ['has --mcode-* tokens', (html.match(/--mcode-/g) || []).length > 40],
   ['no --dsw-* leakage', !/--dsw-/.test(html)],
   ['no remote font family names', !/JetBrains|Inter['"]?\s*,|@font-face/.test(html)],
-  ['innerHTML only on pre via jsonColorize', (html.match(/\.innerHTML/g) || []).length === 2],
+  // This used to be `(html.match(/\.innerHTML/g) || []).length === 2` — a count wearing a
+  // property's name. It failed the moment a third legitimate `jsonColorize` call was added, and
+  // it would have passed just as happily if one of the two had been deleted and the other turned
+  // into an injection. The property is the rule: every one of them writes through jsonColorize,
+  // and only onto a <pre>.
+  ['innerHTML only on pre via jsonColorize',
+    [...html.matchAll(/([A-Za-z_$][\w$]*)\.innerHTML\s*=\s*([^;\n]*)/g)]
+      .length > 0
+    && [...html.matchAll(/([A-Za-z_$][\w$]*)\.innerHTML\s*=\s*([^;\n]*)/g)]
+      .every((m) => m[1] === 'pre' && /jsonColorize\(/.test(m[2]))],
   ['lang zh-CN', /<html lang="zh-CN">/.test(html)],
   ['title 会话轨迹', /<title>会话轨迹<\/title>/.test(html)],
   ['AbortController used', /new AbortController\(\)/.test(html)],
@@ -353,7 +613,12 @@ const checks = [
   ['role=status present', (html.match(/role="status"/g) || []).length >= 3],
   ['semantic header/main/section/footer/nav/form', ['<header', '<main', '<section', '<footer', '<nav', '<form'].every((tag) => html.includes(tag))],
   ['semantic table rendered (static or via createElement)', html.includes('<table') || html.includes("el('table'")],
-  ['poll interval 2500ms', /POLL_INTERVAL = 2500/.test(html)],
+  ['session poll interval 2500ms, declared as the list\'s own cadence', /\bSESSION_POLL_INTERVAL = 2500\b/.test(html) && !/\bPOLL_INTERVAL = /.test(html)],
+  ['trajectory poll interval 8000ms, slower than the list\'s', /\bTRAJECTORY_POLL_INTERVAL = 8000\b/.test(html)],
+  // Two ticks, not one. The single `POLL_INTERVAL` this replaced cannot come back as a substring
+  // of either name — `SESSION_POLL_INTERVAL` contains `POLL_INTERVAL`, so an assertion written
+  // against the old bare name passes against either constant and means nothing.
+  ['no single shared poll interval is left behind', !/\bPOLL_INTERVAL\b/.test(html.replace(/SESSION_POLL_INTERVAL|TRAJECTORY_POLL_INTERVAL/g, ''))],
   ['handoff raw limit 8000', /HANDOFF_RAW_LIMIT = 8000/.test(html)],
   ['all 6 append error codes handled', ['user_cancelled', 'invalid_request', 'text_too_large', 'not_allowed', 'target_unavailable', 'result_unknown'].every((c) => html.includes(c))],
   // The type chips are the one filter. A second row of layer buttons was removed because a
@@ -449,7 +714,7 @@ const checks = [
     return sum === stats.turnsWithPrompt;
   });
 })()],
-  // Scoped to the rendered label, not the whole file: the doc comment above turnContext
+  // Scoped to the rendered label, not the whole file: the doc comment above turnSubNode
   // explains why 续作答答 was renamed and has to be able to say so.
   ['turn breakdown renders 提问轮, not 提问待答',
     /'提问轮 ' \+ formatInt\(asked\)/.test(html) && !/'提问待答 ' \+ formatInt/.test(html) && !/'续作答答 ' \+ formatInt/.test(html)],
@@ -460,17 +725,17 @@ const checks = [
   // the fix, so assert it is there rather than asserting the reader will notice.
 ['context group is marked as a separate population', (() => {
   if (!liftTurnFns()) return false;
-  const suffix = sandbox.turnContextSuffix({ steers: 15, compactionTurns: 10, continuationTurns: 5 });
+  const line = textOf(sandbox.turnSubNode({ steers: 15, compactions: 10, continuationTurns: 5 }));
   // The boundary is the separator FOLLOWED by 另有. The leading `·` is what joins this group
   // to the breakdown and must stay — an earlier version of this guard asserted it was absent,
   // which was wrong: without it the two groups run together, which is the original defect.
-  return /·\s*另有\s/.test(suffix);
+  return /·\s*另有\s/.test(line);
 })()],
   // And the whole rendered line, as the reader receives it, still partitions correctly once
   // the context group is set aside: the numbers before 另有 sum to the headline.
   ['numbers before 另有 sum to the headline', (() => {
-  const line = sandbox.turnBreakdown({ turnsWithPrompt: 63, qaTurns: 5, openTurns: 9 })
-    + sandbox.turnContextSuffix({ steers: 15, compactionTurns: 10, continuationTurns: 5 });
+  const line = textOf(sandbox.turnSubNode({ turnsWithPrompt: 63, qaTurns: 5, openTurns: 9,
+    steers: 15, compactions: 10, continuationTurns: 5 }));
   const before = line.split('另有')[0];
   const nums = [...before.matchAll(/(\d[\d,]*)/g)].map((m) => Number(m[1].replace(/,/g, '')));
   return nums.reduce((a, n) => a + n, 0) === 63;
@@ -521,6 +786,42 @@ const checks = [
     && parts[0].value === '12'
     && parts[0].kind === 'compaction';
 })()],
+  // ---------------------------------------------------------------------------------
+  // Every field scopedStats WRITES has to be one it DECLARES.
+  //
+  // scopedStats re-scopes the server's stats to a time range, and it does that by writing its
+  // own literal rather than reading the server's. That literal is a second copy of a shape that
+  // lives in two processes, and a copy of a shape drifts silently: `steers` was declared on the
+  // server (server.mjs `steers: 0`) and not here, while the function still did
+  // `stats.steers += 1`. `undefined + 1` is NaN, NaN is sticky, and `isCount()` refuses a
+  // non-finite number — so both readers of that field quietly dropped the term, and 「追加 N」
+  // vanished from the card the moment a range went on. Nothing threw.
+  //
+  // It stayed invisible because the guard that compares scopedStats against the server numbers
+  // field by field carries a HARDCODED list, and `steers` was not in it. A hardcoded list can
+  // only catch the fields someone remembered to write down. This one cannot: it reads the two
+  // halves off the function itself, so a field that is written without being declared fails by
+  // name whatever it is called.
+  // ---------------------------------------------------------------------------------
+  ['every stats field scopedStats writes is one it declares', (() => {
+    const src = fnSource('function scopedStats()');
+    if (!src) return false;
+    const literal = src.slice(src.indexOf('var stats = {'), src.indexOf('};', src.indexOf('var stats = {')));
+    if (!literal) return false;
+    const declared = new Set();
+    // `field: 0,` and `field: { ... }` — the two shapes the literal actually uses.
+    for (const m of literal.matchAll(/^\s*([A-Za-z_$][\w$]*):/gm)) declared.add(m[1]);
+    const written = new Set();
+    // `stats.x += 1`, `stats.x = 0`, `stats.x++`, and the nested `stats.tokens.input += 1`:
+    // a nested write needs its PARENT declared, which is the root name this captures.
+    for (const m of src.matchAll(/\bstats\.([A-Za-z_$][\w$]*)\s*(?==[^=]|\+\+|--|\+=|-=|\*=|\/=|\.\w)/g)) {
+      written.add(m[1]);
+    }
+    // Reads are not writes: `stats.messagesAll` is read from `base` and `stats.tokens` is only
+    // ever read as a parent, so neither has to be a counter. What must hold is the other
+    // direction — nothing may be written that the literal does not declare.
+    return [...written].every((field) => declared.has(field));
+  })()],
   // The explanation has to exist on the card, be reachable without a mouse, and be named by
   // aria-describedby rather than only by a `title` (which is invisible to touch and to most
   // assistive tech once the hover is gone).
@@ -642,16 +943,48 @@ const checks = [
   // through the helper. The \b matters — resetWindowMode contains the substring setWindowMode,
   // and without it every reset counts as a direct call and the guard can never pass.
   //
-  // The reset count is an inventory, not a rule: eight when every filter reset the window,
-  // ten since the time range gained resets on both sides of its own lifecycle, eleven once
-  // 异常 became a filter of its own and had to reset the window like the others do, and twelve
-  // once 异常 grew a way back — 全部数据 — which is a filter change like any other and would
-  // otherwise leave the reader on a stale window after leaving anomaly mode. It used to force
-  // 「全部」 instead of resetting, which would have shown up here as a second direct call — and
-  // measured, that cost a 414,000px document on a range covering the session.
+  // The window-reset inventory moved by one because the search answer now arrives from the server:
+  // the moment it does, the table holds a different set of records, and that is a filter change
+  // like any other. It used to be twelve because the page filtered its own records synchronously,
+  // so there was never a moment at which the answer changed.
   const direct = (html.match(/\bsetWindowMode\((?!mode\)|DEFAULT_WINDOW_MODE)/g) || []).length;
-  return direct === 1 && (html.match(/resetWindowMode\(\);/g) || []).length === 12;
+  return direct === 1 && (html.match(/resetWindowMode\(\);/g) || []).length === 13;
 })()],
+  // The search half is asynchronous now, so the four rules below have no pure function to hang on
+  // and are read out of the source instead. Each of them is a way the page can render something
+  // plausible and wrong: a stale answer on screen, an answer that empties the table while it is
+  // still out, a filter left applied after the reader cleared it, and a slice search answered about
+  // the whole lineage.
+  ['the search request in flight is aborted when a newer one starts', (() => {
+    const src = fnSource('function runSearch(needle)');
+    if (!src) return false;
+    if (!/if \(searchController\) searchController\.abort\(\);/.test(src)) return false;
+    return /var controller = new AbortController\(\);/.test(src) && /signal: controller\.signal/.test(src);
+  })()],
+  ['only the newest search answer is allowed to write', (() => {
+    const src = fnSource('function runSearch(needle)');
+    if (!src) return false;
+    // One guard on the way in is not enough: the catch must be gated too, or a FAILED older
+    // request can put its error on top of a newer request's answer.
+    const gates = src.match(/if \(seq !== searchSeq\) return;/g) || [];
+    return gates.length === 2 && /var seq = \(searchSeq \+= 1\);/.test(src);
+  })()],
+  ['a payload that changed re-runs the search rather than filtering by the old answer', (() => {
+    const src = fnSource('function applyPayload(body, manual)');
+    if (!src) return false;
+    return /if \(changed && state\.query\) runSearch\(state\.query\);/.test(src);
+  })()],
+  ['clearing the filters drops the answer with them', (() => {
+    const src = fnSource('function resetBaseFilters()');
+    if (!src) return false;
+    return /state\.searchHits = null;/.test(src) && /state\.searchError = null;/.test(src);
+  })()],
+  ['a search is asked about the slice the reader is looking at', (() => {
+    const src = fnSource('function runSearch(needle)');
+    if (!src) return false;
+    return /'\/api\/trajectory\/search\?session='/.test(src)
+      && /&generation=' \+ encodeURIComponent\(String\(state\.generation\)\)/.test(src);
+  })()],
   // Clicking the window button must not move the page. It scrolled to the document tail
   // whenever it narrowed the window, on the theory that "back to the tail" should land on the
   // newest record. The reader clicked a control they were already looking at, so the jump threw
@@ -717,11 +1050,13 @@ const checks = [
     && /item\.appendChild\(buildCompactionBand\(group\.entries\[j\]\)\)/.test(loop);
 })()],
   // The band is a real control: it carries the same data-row-id the inspector looks up, so
-  // clicking it opens the checkpoint's details rather than doing nothing.
+  // clicking it opens the checkpoint's details rather than doing nothing. The two halves are
+  // deliberately different units — the DOM key has to name ONE row for the scroll anchor, and
+  // the selection stays on the message — so both are matched.
   ['the compaction band is selectable and states what it is', (() => {
   const src = fnSource('function buildCompactionBand(entry)');
   if (!src) return false;
-  return /setAttribute\('data-row-id', record\.id \|\| String\(record\.index\)\)/.test(src)
+  return /setAttribute\('data-row-id', recordKey\(record\)\)/.test(src)
     && /selectRecord\(record\.id\)/.test(src)
     // The point of the band is that it says what changed, so the generation and the moment both
     // have to be in it. Neither is decoration. The condition is matched whole: a mutation that

@@ -6,6 +6,20 @@ import { createServer } from 'node:http';
 import { basename, join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import {
+  MAX_HITS,
+  SEARCH_FIELDS,
+  buildSegment,
+  createSegmentStore,
+  fileIdxRowsFromPayload,
+  foldNeedle,
+  generationKey,
+  needleIsUsable,
+  normaliseWhitespace,
+  readSegmentHits,
+  scanSegment,
+  searchSurfaceOf,
+} from './search-segments.mjs';
 
 /** @typedef {import('./miniapp-api.js').MiniAppContext} MiniAppContext */
 /** @typedef {import('./miniapp-api.js').MiniAppLifecycle} MiniAppLifecycle */
@@ -67,16 +81,25 @@ const SESSION_CACHE_TTL_MS = 5000;
 const SESSION_CACHE_ENTRIES = 80;
 const TRAJECTORY_CACHE_ENTRIES = 4;
 /**
+ * The most hits one search response carries. The count is still reported in full — a needle that
+ * matches ten thousand records is a real answer — so this is a transport bound and not a claim
+ * about how many there were.
+ */
+const MAX_SEARCH_HITS = MAX_HITS;
+/**
  * Upper bound on the parsed generation rows kept resident, in bytes.
  *
- * The whole-session cache above stores serialized bodies; this one stores parsed object
- * graphs, which cost several times their source text. Measured on this machine: JSON.parse
- * retains 1.36x the text of the emitted payload, and that is a floor — the payload has
- * already had its message bodies stripped by splitRawRecords, so the rows graph is larger.
- * A 95 MB lineage lands somewhere in 130-290 MB.
+ * This budget no longer covers the file that matters. A cache keyed on path+size+mtime for a file
+ * that is being appended to has no hit rate to speak of: `handleTrajectory` only reaches the parse
+ * after the trajectory key — which carries the same size and mtime — has already missed, so every
+ * store here is followed by a miss and the entry is dead weight that still costs its rows'
+ * memory. Measured on this machine, retaining it was the largest single cost in the process: 378 MB
+ * of heap after one session and 304 polls, against 145 MB once it is not retained.
  *
- * The trade is deliberate: it converts roughly 350 MB of allocation every 2.5 s into one
- * resident cost. Pinned by tests/verify-parsed-rows.mjs.
+ * What is left is the sealed generations, whose stat never changes and which are therefore the
+ * only parses a second request can genuinely reuse. Those files are rare at a session root — the
+ * store keeps rotated generations under `snapshots/`, not beside `messages.jsonl` — so the budget
+ * is now generous rather than tuned. Pinned by tests/verify-parsed-rows.mjs.
  */
 const PARSED_ROWS_CACHE_BYTES = 256 * 1024 * 1024;
 /**
@@ -93,11 +116,32 @@ const PARSED_ROWS_CACHE_BYTES = 256 * 1024 * 1024;
  * re-parsed them on the next poll. The budget is only as good as this number.
  */
 const PARSED_ROWS_HEAP_PER_SOURCE_BYTE = 2;
+/**
+ * How many decoded messages one trajectory entry keeps for `/raw`, per open session.
+ *
+ * Bounded by count rather than bytes because the thing being kept is one message, and a 64 KB cap
+ * is already what decides whether a message is too big to show. The point is not to be a cache —
+ * it is so that paging back and forth in the inspector does not re-read the file each time — and a
+ * reader who opens more than this many at once is served correctly either way.
+ */
+const RAW_DECODE_CACHE_ENTRIES = 32;
 const SESSION_STORE_TOKEN = '<session-store>';
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-const ROLE_PATTERN = /"role"\s*:\s*"(user|assistant|toolResult|custom)"/g;
-const TURN_PATTERN = /"turn_id"\s*:\s*"([^"]*)"/g;
-const BLOCK_PATTERN = /"type"\s*:\s*"(toolCall|thinking|text)"/g;
+/**
+ * Scans for the list counters, one per field. Each one stops right after the opening quote of
+ * the value, so the value can be read out of `text` by position instead of being captured —
+ * which is the whole point: a capturing `matchAll` allocates a match object per hit, and on a
+ * 64 KB prefix with thousands of messages that is thousands of short-lived objects per session,
+ * per rebuild.
+ *
+ * They carry `/g` and are driven with `test`, which allocates nothing. That mutates `lastIndex`,
+ * and `matchAll` (which the previous version used) did not, so every scan resets it first.
+ * These are module-level on purpose — a `new RegExp` per call would trade the allocation back.
+ */
+const MESSAGE_ID_SCAN = /"message_id"\s*:/g;
+const ROLE_SCAN = /"role"\s*:\s*"/g;
+const TURN_SCAN = /"turn_id"\s*:\s*"/g;
+const BLOCK_SCAN = /"type"\s*:\s*"/g;
 const ABSOLUTE_STORE_PATTERN = /(?:[A-Za-z]:[\\/])?[^\s"'`<>|]{0,120}?[\\/]?\.minimax(?:[\\/][^\s"'`<>|]{0,160})?/g;
 
 /**
@@ -161,9 +205,60 @@ export function clipField(value, max) {
 }
 
 /**
+ * Whether a projected field carries nothing a reader could be shown.
+ *
+ * The page has its own `isNil` and it counts an empty string as nothing; this is the same three
+ * cases. They have to agree, because the page decides whether to draw a tab from the flag this
+ * produces — a definition that treated `''` as present would offer a tab that renders an empty box.
+ *
+ * @param {unknown} value
+ */
+function isNilField(value) {
+  return value === null || value === undefined || value === '';
+}
+
+/**
  * Replaces internal store locations so the browser never learns where sessions live.
  * @param {readonly string[]} secrets
  */
+/** The three spellings an absolute path can appear in inside a stack frame or an error message. */
+const ABSOLUTE_PATH_SHAPES = [
+  // Node prints a frame as a URL: `file:///C:/Users/...`. Scheme, forward slashes, and the whole
+  // thing up to the first delimiter, which is why this has to come first — the drive-letter pattern
+  // below would match `C:/Users/...` inside it and leave `file:///` standing in front.
+  /file:\/\/\/?[^\s'"()<>\]]+/g,
+  // A drive-qualified Windows path, backslashed or forward-slashed, which is what an exception
+  // message from this platform uses. (Spelled out in words: a literal drive-qualified user
+  // directory in a comment trips the shipped-tree scan that forbids machine paths, which is the
+  // same rule this function exists to serve.)
+  /[A-Za-z]:[\\/][^\s'"()<>\]]+/g,
+  // A POSIX path with a root that only a filesystem has. Deliberately not a bare `/`: every URL,
+  // every route and every regex in this file starts with one, and blanking those would make the
+  // output useless for the job the route exists to do.
+  /(?<![\w./-])\/(?:Users|home|var|tmp|opt|etc|private|Volumes|Applications)\b[^\s'"()<>\]]*/g,
+];
+
+/**
+ * Blanks every absolute path in a string.
+ *
+ * `/api/runtime` is the one route whose entire contract is what it does NOT send, and a Node stack
+ * frame is mostly paths — one per frame, by absolute path. `createRedactor` covers the three store
+ * locations in the spelling it was handed, which is not the spelling a stack uses, so a stack passed
+ * through it keeps its `file:///` frames. That was measured rather than assumed: the route's
+ * `.minimax` fallback catches the store's own directories, and leaves everything else in the frame.
+ *
+ * Deliberately NOT folded into `createRedactor`. That one also runs over session CONTENT, where
+ * blanking an unrelated string would change what a reader is shown; a stack carries nothing a reader
+ * came for, which is exactly why this is allowed to be blunt where that one is not.
+ *
+ * @param {unknown} value
+ */
+export function scrubAbsolutePaths(value) {
+  let out = String(value);
+  for (const shape of ABSOLUTE_PATH_SHAPES) out = out.replace(shape, SESSION_STORE_TOKEN);
+  return out;
+}
+
 export function createRedactor(secrets) {
   const prefixes = [...new Set(secrets.filter((entry) => typeof entry === 'string' && entry.length > 0))]
     .sort((a, b) => b.length - a.length);
@@ -176,55 +271,129 @@ export function createRedactor(secrets) {
 }
 
 /**
- * @param {string} text
- * @returns {{ rows: Array<Record<string, any>>, skipped: number }}
+ * One generation file's rows, plus where each row's line sits in the bytes they were read from.
+ *
+ * The positions are the second half of what this returns, and they are not a convenience: they
+ * are the only thing `/raw` has left once the parsed rows are released, which is what stops a
+ * 68 MB session from costing hundreds of megabytes of resident object graph. A line's bytes are
+ * found again by seeking to `start` and taking `end - start` of them, and the digest is what says
+ * they are still the same bytes.
+ *
+ * Offsets are byte offsets into `source`. For the route that source is a file read from offset 0,
+ * so they are byte offsets into the file; the guards that pass text get offsets into that text's
+ * UTF-8 encoding, which is the same relation.
+ *
+ * @param {string | Buffer} source
+ * @returns {{ rows: Array<Record<string, any>>, skipped: number, spans: Array<[number, number]> }}
  */
-export function parseMessagesJsonl(text) {
+export function parseMessagesJsonl(source) {
+  // One code path, two inputs. The route hands over the bytes it already read, which costs
+  // nothing; a caller holding text pays one encode here. Scanning the bytes rather than the string
+  // is also what makes the offsets free — a UTF-16 index is not a byte offset.
+  const bytes = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
   /** @type {Array<Record<string, any>>} */
   const rows = [];
+  /** @type {Array<[number, number]>} */
+  const spans = [];
   let skipped = 0;
   let start = 0;
-  while (start <= text.length) {
-    let end = text.indexOf('\n', start);
-    if (end === -1) end = text.length;
-    const line = text.slice(start, end);
-    start = end + 1;
-    if (line.trim() === '') {
-      if (end >= text.length) break;
-      continue;
+  while (start < bytes.length) {
+    const newline = bytes.indexOf(0x0a, start);
+    const end = newline === -1 ? bytes.length : newline;
+    const line = bytes.subarray(start, end).toString('utf8');
+    if (line.trim() !== '') {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === 'object') {
+          rows.push(parsed);
+          spans.push([start, end]);
+        } else skipped += 1;
+      } catch {
+        skipped += 1;
+      }
     }
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === 'object') rows.push(parsed);
-      else skipped += 1;
-    } catch {
-      skipped += 1;
-    }
-    if (end >= text.length) break;
+    if (newline === -1) break;
+    start = newline + 1;
   }
-  return { rows, skipped };
+  return { rows, skipped, spans };
+}
+
+/**
+ * How much of a line's SHA-256 is kept.
+ *
+ * Sixteen hex characters is 64 bits, which is chosen against the thing it has to survive: two
+ * different lines of the same length producing the same digest. Not a collision an adversary
+ * would have to find — nothing here is attacker-controlled — but the 32-bit FNV that was
+ * considered first, where a 68 MB session makes birthday-range collisions a matter of how many
+ * lines you are willing to hash. A full digest would cost the same to compare and twice the memory
+ * per row.
+ */
+const LINE_DIGEST_CHARS = 16;
+
+/**
+ * @param {Buffer} bytes
+ * @returns {string}
+ */
+export function lineDigest(bytes) {
+  return createHash('sha256').update(bytes).digest('hex').slice(0, LINE_DIGEST_CHARS);
 }
 
 /**
  * Cheap single-pass counters used by the session list; values are approximate by design.
+ *
+ * Allocation-free apart from the turn-id set, which has to hold the ids to count them
+ * distinctly. `tests/verify-count-roles.mjs` runs this against the capturing implementation it
+ * replaced over real session prefixes and hand-written edges, so the rewrite is held to being
+ * the same function rather than merely a faster one.
  * @param {string} text
  */
 export function countRolesInPrefix(text) {
-  const turnIds = new Set();
   const counts = { messages: 0, userMessages: 0, assistantMessages: 0, toolResults: 0, systemMessages: 0, toolCalls: 0, thinkingBlocks: 0, turns: 0 };
-  for (const match of text.matchAll(/"message_id"\s*:/g)) counts.messages += 1;
-  for (const match of text.matchAll(ROLE_PATTERN)) {
-    if (match[1] === 'user') counts.userMessages += 1;
-    else if (match[1] === 'assistant') counts.assistantMessages += 1;
-    else if (match[1] === 'toolResult') counts.toolResults += 1;
-    else counts.systemMessages += 1;
+
+  MESSAGE_ID_SCAN.lastIndex = 0;
+  while (MESSAGE_ID_SCAN.test(text)) counts.messages += 1;
+
+  // The value runs from the scan's `lastIndex` (just past the opening quote) to the next quote.
+  // Comparing length first is what makes `user` not also match `userSomething`, and reading the
+  // span with `startsWith` keeps the comparison from building a substring per hit.
+  const valueIs = (start, literal) => text.startsWith(literal, start)
+    && start + literal.length === valueEnd;
+  /** @type {number} */
+  let valueEnd = 0;
+
+  ROLE_SCAN.lastIndex = 0;
+  while (ROLE_SCAN.test(text)) {
+    const start = ROLE_SCAN.lastIndex;
+    valueEnd = text.indexOf('"', start);
+    // No closing quote left means no later field of this kind can match either, so stop.
+    if (valueEnd < 0) break;
+    if (valueIs(start, 'user')) counts.userMessages += 1;
+    else if (valueIs(start, 'assistant')) counts.assistantMessages += 1;
+    else if (valueIs(start, 'toolResult')) counts.toolResults += 1;
+    // `custom` is the fourth role the counters recognize. A value outside the four is not a
+    // role this list counts at all, and must stay uncounted rather than falling into the else.
+    else if (valueIs(start, 'custom')) counts.systemMessages += 1;
   }
-  for (const match of text.matchAll(TURN_PATTERN)) turnIds.add(match[1]);
-  for (const match of text.matchAll(BLOCK_PATTERN)) {
-    if (match[1] === 'toolCall') counts.toolCalls += 1;
-    else if (match[1] === 'thinking') counts.thinkingBlocks += 1;
+
+  const turnIds = new Set();
+  TURN_SCAN.lastIndex = 0;
+  while (TURN_SCAN.test(text)) {
+    const start = TURN_SCAN.lastIndex;
+    const end = text.indexOf('"', start);
+    if (end < 0) break;
+    turnIds.add(text.slice(start, end));
   }
   counts.turns = turnIds.size;
+
+  BLOCK_SCAN.lastIndex = 0;
+  while (BLOCK_SCAN.test(text)) {
+    const start = BLOCK_SCAN.lastIndex;
+    valueEnd = text.indexOf('"', start);
+    if (valueEnd < 0) break;
+    if (valueIs(start, 'toolCall')) counts.toolCalls += 1;
+    else if (valueIs(start, 'thinking')) counts.thinkingBlocks += 1;
+  }
+
   return counts;
 }
 
@@ -281,9 +450,20 @@ export function truncatedByCap(size, limit) {
 }
 
 /**
+ * Read at most `limit` bytes from the start of a file, cut back to the last complete line.
+ *
+ * The read always starts at offset 0 and never moves, so an index into `buffer` is also the byte
+ * offset of the same place in the file. That is what lets `/raw` go back to one line later without
+ * the parsed rows still being in memory, and it is the reason `buffer` is the primary result:
+ * decoding the whole thing into a JS string is what this function used to return, and a 68 MB
+ * JSONL read as UTF-16 is up to 136 MB of heap for the duration of the parse.
+ *
+ * `text` is derived from those bytes on demand for the callers that want a string, and cached
+ * because the fixtures read it more than once.
+ *
  * @param {string} filePath
  * @param {number} limit
- * @returns {Promise<{ text: string, size: number, read: number }>}
+ * @returns {Promise<{ buffer: Buffer, text: string, size: number, read: number }>}
  */
 export async function readHead(filePath, limit) {
   const handle = await open(filePath, 'r');
@@ -301,9 +481,58 @@ export async function readHead(filePath, limit) {
     const view = buffer.subarray(0, filled);
     const lastNewline = view.lastIndexOf(0x0a);
     const usable = lastNewline === -1 ? filled : lastNewline;
-    return { text: view.subarray(0, usable).toString('utf8'), size, read: filled };
+    const usableBytes = view.subarray(0, usable);
+    /** @type {string | null} */
+    let decoded = null;
+    return {
+      buffer: usableBytes,
+      size,
+      read: filled,
+      get text() {
+        if (decoded === null) decoded = usableBytes.toString('utf8');
+        return decoded;
+      },
+    };
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * Read exactly `[start, end)` out of a file, for one line.
+ *
+ * Used only by `/raw`, and only after the line's position was recorded during the parse. The
+ * length check is not decoration: a file that shrank since then would otherwise answer with
+ * whatever now sits at that offset.
+ *
+ * @param {string} filePath
+ * @param {number} start
+ * @param {number} end
+ * @returns {Promise<Buffer | null>} null when the file no longer reaches `end`
+ */
+export async function readRange(filePath, start, end) {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) return null;
+  let handle;
+  try {
+    handle = await open(filePath, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const stat = await handle.stat();
+    if (stat.size < end) return null;
+    const buffer = Buffer.allocUnsafe(end - start);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, start + filled);
+      if (bytesRead <= 0) return null;
+      filled += bytesRead;
+    }
+    return buffer;
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 
@@ -472,11 +701,13 @@ export function readGenerationMarker(headText) {
  * take the generation it declares, then step back one generation at a time through the
  * parent each file names.
  *
- * The catalog is used only to find candidate files. Every candidate still has to open and
- * declare the generation it was reached for, so a catalog that lists a file belonging to a
- * different lineage cannot smuggle it in, and a file whose parent generation is not exactly
- * one lower ends the chain instead of being stitched on. Snapshots never reached are orphans
- * — a fork leaves them behind — and are reported rather than shown.
+ * The catalog is used only to find candidate files, with one exception: a file that opens with
+ * no marker is taken at the generation the catalog reached it for, because a file that declares
+ * nothing offers nothing to check it against. Every file that DOES declare a generation still
+ * has to declare the one it was reached for, so a catalog that lists a file belonging to a
+ * different lineage cannot smuggle it in, and a file whose parent generation is not exactly one
+ * lower ends the chain instead of being stitched on. Snapshots never reached are orphans — a
+ * fork leaves them behind — and are reported rather than shown.
  *
  * @param {{ generations: Array<{ generation: number, kind: string, fileName: string, byteLength: number | null, messageCount: number | null, revision: string | null, active: boolean }> }} catalog
  * @param {(generation: number | null) => Promise<{ fileName: string, marker: { generation: number, parentGeneration: number | null } | null } | null>} probe `null` asks for the active file
@@ -490,7 +721,21 @@ export async function walkLineage(catalog, probe) {
   const activeProbe = await probe(null);
   if (activeProbe === null) return { chain: [], orphans: [] };
 
-  const activeGeneration = activeProbe.marker ? activeProbe.marker.generation : 0;
+  // A file that opens with a marker says which generation it is, and the file wins: it is the
+  // thing the rest of this function is about verifying. Not every active file opens with one
+  // though — the marker rides on the checkpoint row that ROTATED the generation, so a session
+  // whose active file was rewritten in place has none. Read from the head of an active file and
+  // find nothing, and the walk used to start at generation 0: it reached no parent, so every
+  // sealed generation it actually had was reported as an orphan and never shown.
+  //
+  // The catalog names the same generation, and where both exist they agree — measured over every
+  // session on this machine with a catalog: 5 of 5 agree, none contradicts. So the catalog is
+  // used for exactly the value the file does not carry, and a file that does carry one still
+  // overrides it. That keeps the rule this function already states: the catalog finds candidate
+  // files, and each file still has to declare the generation it is reached for.
+  const activeGeneration = activeProbe.marker
+    ? activeProbe.marker.generation
+    : activeCatalogGeneration(null, catalog.generations) ?? 0;
   const chain = [{ generation: activeGeneration, fileName: activeProbe.fileName }];
   const reached = new Set([activeGeneration]);
 
@@ -500,7 +745,13 @@ export async function walkLineage(catalog, probe) {
     if (!byGeneration.has(want)) break;
     const parent = await probe(want);
     if (parent === null) break;
-    const declared = parent.marker ? parent.marker.generation : 0;
+    // A file that opens with no marker declares nothing, so there is nothing to check it
+    // against — and refusing it would drop a sealed generation the session really has. The
+    // first snapshot of a session that never compacted is exactly this shape: the marker rides
+    // on the checkpoint row that rotated the generation, and there was never one. Taken at the
+    // generation the catalog reached it for. A file that DOES declare a different generation is
+    // still refused, which is what keeps a fork's snapshot out.
+    const declared = parent.marker ? parent.marker.generation : want;
     if (declared !== want) break;
     if (parent.marker && parent.marker.parentGeneration !== null && parent.marker.parentGeneration !== want - 1) break;
     if (reached.has(declared)) break;
@@ -535,15 +786,50 @@ export async function readSessionIdentity(dir) {
 }
 
 /**
- * Depth-capped walk that only descends into dated folders and never into a session folder twice.
+ * The whole candidate set from one walk, as two products of the same traversal.
+ *
+ * These used to be one thing, and that is the defect. `slice(0, MAX_SESSION_LIST)` ran last,
+ * so the only handle the service had on a session directory was "one of the 30 most recently
+ * touched" — and `resolveTrajectoryRequest` resolved an explicit id by scanning exactly those
+ * 30. Measured on this machine: 146 candidate directories, 30 exposed, 116 of them
+ * unreachable by id (window inside 200/200, a sample outside 404/404). A session the user
+ * could name but not open is a correctness bug, not a small one.
+ *
+ * So the traversal now yields two things:
+ *
+ *  - `recentEntries` — sorted by mtime, capped at `MAX_SESSION_LIST`. This is what the picker
+ *    shows, and it stays exactly as small as it was.
+ *  - `byDecodedId` — every candidate directory, keyed by the id decoded from its own name.
+ *    Decoding reads no file: the walk already stat'ed `messages.jsonl` for every candidate, so
+ *    the index costs no I/O the walk was not doing anyway.
+ *
+ * Two properties this must not lose:
+ *
+ *  - A decoded name is a *claim*, not a fact. `readSessionIdentity` prefers `manifest.sessionId`
+ *    over the directory name, so every caller of this index still reads the identity of the one
+ *    directory it picked and checks the id before serving it.
+ *  - Two directories can decode to the same id. `Map.set` would silently keep whichever came
+ *    last, which makes the answer depend on `readdir` order. Duplicates are therefore kept as a
+ *    list and resolved against the manifests, not discarded and not guessed.
+ *
+ * `truncated` says the walk hit `MAX_SESSION_CANDIDATES` and stopped early. That budget is a
+ * resource guard, and it must not be allowed to masquerade as "this session does not exist" —
+ * callers use it to say the scan budget was exhausted, which is a different answer and a
+ * truthful one.
+ *
  * @param {string} sessionsRoot
+ * @returns {Promise<{ recentEntries: Array<{ dir: string, sizeBytes: number, lastActiveAt: number }>,
+ *   byDecodedId: Map<string, Array<{ dir: string, sizeBytes: number, lastActiveAt: number }>>,
+ *   truncated: boolean }>}
  */
-export async function collectSessionEntries(sessionsRoot) {
+export async function collectSessionCandidates(sessionsRoot) {
   /** @type {Array<{ dir: string, sizeBytes: number, lastActiveAt: number }>} */
   const entries = [];
+  let truncated = false;
   /** @param {string} dir @param {number} depth */
   const walk = async (dir, depth) => {
-    if (depth > MAX_WALK_DEPTH || entries.length >= MAX_SESSION_CANDIDATES) return;
+    if (depth > MAX_WALK_DEPTH) return;
+    if (entries.length >= MAX_SESSION_CANDIDATES) { truncated = true; return; }
     let names;
     try {
       names = await readdir(dir);
@@ -551,7 +837,7 @@ export async function collectSessionEntries(sessionsRoot) {
       return;
     }
     for (const name of names) {
-      if (entries.length >= MAX_SESSION_CANDIDATES) return;
+      if (entries.length >= MAX_SESSION_CANDIDATES) { truncated = true; return; }
       const child = join(dir, name);
       if (isSessionDirName(name)) {
         try {
@@ -568,7 +854,34 @@ export async function collectSessionEntries(sessionsRoot) {
   };
   await walk(sessionsRoot, 0);
   entries.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
-  return entries.slice(0, MAX_SESSION_LIST);
+
+  /** @type {Map<string, Array<{ dir: string, sizeBytes: number, lastActiveAt: number }>>} */
+  const byDecodedId = new Map();
+  for (const entry of entries) {
+    const id = decodeSessionIdFromDirName(basename(entry.dir));
+    // A name that does not decode is still a real session; it just has no fast path and is
+    // found the slow way. Dropping it here would turn "no fast path" into "does not exist".
+    if (!id) continue;
+    const bucket = byDecodedId.get(id);
+    if (bucket) bucket.push(entry);
+    else byDecodedId.set(id, [entry]);
+  }
+
+  return { recentEntries: entries.slice(0, MAX_SESSION_LIST), byDecodedId, truncated };
+}
+
+/**
+ * Depth-capped walk that only descends into dated folders and never into a session folder twice.
+ *
+ * Kept as its own export with its old shape and its old meaning — "the most recent sessions" —
+ * because the fixture builders and several guards consume exactly that. The id index lives in
+ * `collectSessionCandidates` and is deliberately not exposed through this one.
+ *
+ * @param {string} sessionsRoot
+ * @returns {Promise<Array<{ dir: string, sizeBytes: number, lastActiveAt: number }>>}
+ */
+export async function collectSessionEntries(sessionsRoot) {
+  return (await collectSessionCandidates(sessionsRoot)).recentEntries;
 }
 
 /**
@@ -694,13 +1007,38 @@ export async function readSessionTitles(home, sessionIds) {
   if (!db) return result;
   try {
     if (sessionIds.length === 0) return result;
-    const stmt = db.prepare('select session_id, title, session_kind from local_runtime_sessions where session_id = ?');
+    // The parent id is the fact that a branch exists, and it is the ONLY part of that
+    // relationship that is always available: the list is the most recent N sessions, and a child
+    // is always newer than the parent that spawned it, so the parent's title is routinely outside
+    // the window. Carrying the id and looking the title up would therefore be a lookup that fails
+    // exactly when a reader is most likely to want it.
+    //
+    // Asking for the column is the optional part, and it has to be optional: a runtime database
+    // written before child sessions existed has no `parent_session_id`, and preparing a statement
+    // over a column that is not there throws before a single row has been read. Under the empty
+    // catch below that is not a degraded list -- it is every title and every kind in the page
+    // silently reverting to the first sentence of the transcript, which is what a reader would see
+    // as "the titles broke and nothing says why". The mapping below already answers `null` for a
+    // row that carries no parent, so the row this fallback returns needs no change at all.
+    let stmt;
+    try {
+      stmt = db.prepare('select session_id, title, session_kind, parent_session_id from local_runtime_sessions where session_id = ?');
+    } catch {
+      try {
+        stmt = db.prepare('select session_id, title, session_kind from local_runtime_sessions where session_id = ?');
+      } catch {
+        return result;
+      }
+    }
     for (const id of sessionIds) {
       const row = stmt.get(id);
       if (!row) continue;
       result.set(id, {
         title: typeof row.title === 'string' && row.title.trim() ? row.title.trim() : null,
         kind: typeof row.session_kind === 'string' ? row.session_kind : null,
+        parent: typeof row.parent_session_id === 'string' && row.parent_session_id !== ''
+          ? row.parent_session_id
+          : null,
       });
     }
   } catch {
@@ -860,10 +1198,17 @@ export function toolCallSummary(name, args) {
  *
  * Records are carried per turn, not as one flat list, so this walks the turns.
  *
+ * `rowPos` is optional and collected in the same pass. It is the record's position among the
+ * records its own row produced, which `/api/trajectory/record` needs to say *which* of them it is
+ * answering for — the locator alone says which message, and one message can be several records.
+ * It is an out-parameter rather than a second return because this is the one place already walking
+ * every record, and a second walk to read a number is how two passes drift apart.
+ *
  * @param {Array<Record<string, any>>} turns
+ * @param {Map<number, number> | null} [rowPos]
  * @returns {Map<number, number>}
  */
-export function splitRawRecords(turns) {
+export function splitRawRecords(turns, rowPos = null) {
   /** @type {Map<number, number>} */
   const raws = new Map();
   if (!Array.isArray(turns)) return raws;
@@ -877,11 +1222,439 @@ export function splitRawRecords(turns) {
       const rowIndex = record.rawRow;
       if (Number.isInteger(index) && index > 0 && typeof rowIndex === 'number' && Number.isInteger(rowIndex) && rowIndex >= 0) {
         raws.set(index, rowIndex);
+        // Collected here, while the record is in hand, and only for a record that has a locator to
+        // answer with. A position with no message behind it cannot be projected and must not be
+        // offered as if it could.
+        const pos = record.rowPos;
+        if (rowPos !== null && typeof pos === 'number' && Number.isInteger(pos) && pos >= 0) {
+          rowPos.set(index, pos);
+        }
       }
       delete record.rawRow;
     }
   }
   return raws;
+}
+
+/**
+ * Takes the four heavy fields off every record, in place, and hands the payload back.
+ *
+ * Measured over this machine's whole session store — 149 files, 13223 records, 27.2 MB of payload:
+ * `result` 26.6%, `thinking` 13.2%, `arguments` 9.3%, `text` 8.9%. **59.1% of the body**, and the
+ * page was holding all of it to draw a ledger row and, once in a while, one inspector tab.
+ *
+ * The values are on the records when this is called and still on them afterwards: the search reads
+ * them in this process, and `/api/trajectory/record` re-projects the one row it needs. What goes
+ * away is the copy that crosses the wire and lands in the page's heap.
+ *
+ * In place, and in one place. The flags were measured at `push()`, so there is nothing here that
+ * can disagree with them — a second measurement site is exactly how the page and the server came
+ * to answer 「这条记录有没有正文」 differently.
+ *
+ * @param {{ turns?: Array<any> }} payload
+ */
+export function slimPayloadForWire(payload) {
+  const turns = payload && Array.isArray(payload.turns) ? payload.turns : [];
+  for (const turn of turns) {
+    const records = turn && Array.isArray(turn.records) ? turn.records : [];
+    for (const record of records) {
+      if (!record || typeof record !== 'object') continue;
+      delete record.text;
+      delete record.thinking;
+      delete record.arguments;
+      delete record.result;
+    }
+  }
+  return payload;
+}
+
+/**
+ * Every record of a built payload whose own search text contains the needle.
+ *
+ * The whole of the search's answer, and a pure function of what is already in hand, so the rule can
+ * be pinned without a runtime: it runs over the PROJECTED view rather than over the stored rows, so
+ * a version the identity layer suppressed cannot be reported as a row in the ledger, and it tests
+ * one record at a time, so a needle cannot be answered by a phrase that spans two of them.
+ *
+ * `limit` bounds what is RETURNED and never what is COUNTED. A needle that matches ten thousand
+ * records is a real answer, and saying so is more useful than a silent truncation.
+ *
+ * @param {{ turns: Array<any> }} payload
+ * @param {string} needle already normalised and folded
+ * @param {number} limit
+ * @returns {{ hits: Array<{ index: number, turnIndex: number, kind: string, summary: string, generation: number | null }>, total: number }}
+ */
+export function collectSearchHits(payload, needle, limit) {
+  /** @type {Array<{ index: number, turnIndex: number, kind: string, summary: string, generation: number | null }>} */
+  const hits = [];
+  let total = 0;
+  const turns = payload && Array.isArray(payload.turns) ? payload.turns : [];
+  for (const turn of turns) {
+    const records = Array.isArray(turn.records) ? turn.records : [];
+    for (const record of records) {
+      if (!searchSurfaceOf(record).includes(needle)) continue;
+      total += 1;
+      if (hits.length >= limit) continue;
+      hits.push({
+        index: record.index,
+        turnIndex: turn.index,
+        kind: record.kind,
+        // Already projected and already redacted. Sending it is how the reader sees WHAT matched
+        // without opening every row the needle found.
+        summary: typeof record.summary === 'string' ? record.summary : '',
+        generation: typeof record.generation === 'number' ? record.generation : null,
+      });
+    }
+  }
+  return { hits, total };
+}
+
+
+/**
+ * The five fields a search reads, in the page's order, normalised and folded exactly as the stored
+ * surfaces are. Re-exported so a guard can compare the page's own `recordSearchText` against this
+ * without reaching into a private module.
+ */
+export { SEARCH_FIELDS, normaliseWhitespace, searchSurfaceOf, scanSegment, foldNeedle, needleIsUsable };
+
+/**
+ * The runtime's marker for a tool result it dropped while compacting the context.
+ *
+ * Measured across the whole session store: 141 occurrences, and every one of them the same
+ * wording. This is what separates "the runtime rewrote this message" from "something else
+ * changed it" — and that distinction decides whether a repeated message_id is a second COPY of
+ * one message or a second VERSION of it.
+ */
+const TOOL_RESULT_REMOVED = /\[Tool result removed by context compaction\.\]/;
+
+/**
+ * Two rows are the same message with its content taken out — the comparison that tells a declared
+ * trim apart from a rewrite nobody claimed.
+ *
+ * Only `message.content` is removed, because only it is supposed to change: a trim replaces the
+ * result text and leaves the tool name, the call id, the error flag and the turn alone. Anything
+ * else moving means this is not the transformation we recognise.
+ *
+ * `history_artifact` is removed too, for the same reason `contentFingerprint()` removes it. It is
+ * the declaring generation's provenance about itself, not a property of the message, and the store
+ * attaches it to a generation's own opener row rather than to the message it rewrote. Counting it
+ * here made whether a trim was recognised depend on which row happened to carry the annotation —
+ * so a correct rewrite sitting on an annotated row read as an unexplained difference, and the two
+ * functions disagreed about the same field for opposite reasons.
+ *
+ * @param {any} a
+ * @param {any} b
+ * @returns {boolean}
+ */
+function equalOutsideContent(a, b) {
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  const am = a.message;
+  const bm = b.message;
+  if (am === null || bm === null || typeof am !== 'object' || typeof bm !== 'object') return false;
+  const { history_artifact: _omittedFromA, ...restA } = a;
+  const { history_artifact: _omittedFromB, ...restB } = b;
+  const left = JSON.stringify({ ...restA, message: { ...am, content: null } });
+  const right = JSON.stringify({ ...restB, message: { ...bm, content: null } });
+  return left === right;
+}
+
+/**
+ * What makes two occurrences the same CONTENT VERSION of a message.
+ *
+ * Not the raw line. The newer generation's own opener carries `history_artifact`, so its bytes
+ * differ from the identical row in the sealed snapshot while nothing about the message changed —
+ * that row is the same version with provenance attached, not a second version. So the fingerprint
+ * drops `history_artifact` and nothing else; `message.content` stays in, because that is exactly
+ * what a version difference is.
+ *
+ * @param {any} row
+ * @returns {string}
+ */
+function contentFingerprint(row) {
+  if (row === null || typeof row !== 'object') return '';
+  const { history_artifact: _omitted, ...rest } = row;
+  return JSON.stringify(rest);
+}
+
+/**
+ * Is this row one the runtime trimmed?
+ *
+ * All four have to hold, and each one on its own is not enough. The marker describes a
+ * GENERATION, not every change inside it; the placeholder wording on its own is just a string that
+ * happens to appear. What is not stated anywhere is assumed not to have happened.
+ *
+ * @param {any} olderRow
+ * @param {any} newerRow
+ * @param {Set<number>} trimmedGenerations generations that declare `producedBy: 'tool_trim'`
+ * @param {number|null} newerGeneration
+ * @returns {boolean}
+ */
+function isDeclaredTrim(olderRow, newerRow, trimmedGenerations, newerGeneration) {
+  if (olderRow?.message?.role !== 'toolResult' || newerRow?.message?.role !== 'toolResult') return false;
+  if (!equalOutsideContent(olderRow, newerRow)) return false;
+  const text = contentToPlainText(newerRow.message.content) ?? '';
+  if (!TOOL_RESULT_REMOVED.test(text)) return false;
+  return newerGeneration !== null && trimmedGenerations.has(newerGeneration);
+}
+
+/**
+ * One logical message, and every content version it was stored in.
+ *
+ * @typedef {object} MessageVersion
+ * @property {string|null} digest
+ * @property {number|null} generation
+ * @property {any} locator
+ * @property {any} row
+ * @property {number} occurrences how many times this exact version turned up
+ * @property {'only'|'trimmed'|'unclassified'} relation how it differs from the first version
+ */
+
+/**
+ * Merge every occurrence of a message across the whole lineage into one identity.
+ *
+ * A message can be stored more than once: the active file may re-record a message a sealed
+ * snapshot already holds (the same bytes, so it is a second copy of one version), and sealing a
+ * generation can rewrite old tool results in place (different bytes, so it is a second version).
+ * Treating either as "delete the later row" loses a message or loses a version, so neither is
+ * what this does: it keeps both and says which kind it is.
+ *
+ * Rows with no usable id are NOT keyed together. The builder accepts a non-string id and maps it
+ * to null, and a shared `null` key would delete real rows or reject the request outright, so
+ * those rows pass straight through in `unkeyed`.
+ *
+ * @param {Array<{ row: any, generation: number|null, locator: any }>} occurrences in lineage order, oldest first
+ * @returns {{
+ *   identities: Map<string, { id: string, turnId: string|null, role: string|null, versions: MessageVersion[], openers: string[] }>,
+ *   unkeyed: Array<{ row: any, generation: number|null, locator: any }>,
+ *   openers: Map<string, string>,
+ *   openerOccurrence: Map<string, { row: any, generation: number|null, locator: any }>,
+ *   conflicts: Array<{ id: string, reason: string, expected: any, found: any }>,
+ *   unclassified: Array<{ id: string, olderGeneration: number|null, newerGeneration: number|null }>,
+ *   trimmedGenerations: Set<number>,
+ *   stats: { occurrences: number, identities: number, identical: number, trimmed: number, unclassified: number, conflicts: number, unkeyed: number },
+ * }}
+ */
+export function buildMessageIdentity(occurrences) {
+  const identities = new Map();
+  const unkeyed = [];
+  const conflicts = [];
+  const unclassified = [];
+  const trimmedGenerations = new Set();
+  const openers = new Map();
+  // Which OCCURRENCE opened each turn, not just which id. A view can contain a message without
+  // containing the copy of it that opened the turn, and "is this row the opener" has to be
+  // answerable by comparing rows rather than by comparing ids.
+  const openerOccurrence = new Map();
+  let identical = 0;
+  let total = 0;
+
+  for (const occ of occurrences) {
+    const row = occ.row;
+    const artifact = row?.history_artifact;
+    if (artifact && artifact.producedBy === 'tool_trim' && Number.isInteger(artifact.generation)) {
+      trimmedGenerations.add(artifact.generation);
+    }
+    const id = typeof row?.message_id === 'string' && row.message_id !== '' ? row.message_id : null;
+    if (id === null) { unkeyed.push(occ); continue; }
+    total += 1;
+
+    const role = typeof row?.message?.role === 'string' ? row.message.role : null;
+    const turnId = typeof row?.turn_id === 'string' ? row.turn_id : null;
+    let entry = identities.get(id);
+    if (entry === undefined) {
+      entry = { id, turnId, role, versions: [], byFingerprint: new Map() };
+      identities.set(id, entry);
+    } else if (turnId !== entry.turnId) {
+      conflicts.push({ id, reason: 'turn_id', expected: entry.turnId, found: turnId });
+    } else if (role !== entry.role) {
+      conflicts.push({ id, reason: 'role', expected: entry.role, found: role });
+    }
+
+    const digest = typeof occ.locator?.digest === 'string' ? occ.locator.digest : null;
+    const fingerprint = contentFingerprint(row);
+    const occurrence = { row, generation: occ.generation ?? null, locator: occ.locator ?? null };
+    const seen = entry.byFingerprint.get(fingerprint);
+    if (seen !== undefined) {
+      // Same content version showing up again. Which generation it belongs to is a property of
+      // the OCCURRENCE, not of the version: a sealed snapshot and the active file can both hold
+      // it, and a generation view has to be able to find the copy that file actually stores.
+      seen.occurrences.push(occurrence);
+      identical += 1;
+      continue;
+    }
+    const version = {
+      fingerprint,
+      digest,
+      generation: occurrence.generation,
+      locator: occurrence.locator,
+      row,
+      occurrences: [occurrence],
+      relation: 'only',
+    };
+    entry.versions.push(version);
+    entry.byFingerprint.set(fingerprint, version);
+  }
+
+  let trimmed = 0;
+  for (const entry of identities.values()) {
+    const first = entry.versions[0];
+    for (let v = 1; v < entry.versions.length; v += 1) {
+      const other = entry.versions[v];
+      if (isDeclaredTrim(first.row, other.row, trimmedGenerations, other.generation)) {
+        other.relation = 'trimmed';
+        trimmed += 1;
+      } else {
+        other.relation = 'unclassified';
+        unclassified.push({ id: entry.id, olderGeneration: first.generation, newerGeneration: other.generation });
+      }
+    }
+  }
+
+  // The turn opener, decided over the whole lineage rather than over whatever a request kept.
+  // Deciding it from the projected slice is what would let a real steer become the first visible
+  // prompt of its turn and be counted as dialogue.
+  for (const entry of identities.values()) {
+    if (entry.role !== 'user' || entry.turnId === null) continue;
+    const message = entry.versions[0].row?.message;
+    const plain = contentToPlainText(message?.content) ?? (typeof message?.text === 'string' ? message.text : null);
+    if (splitUserMessage(message ?? {}, plain).prompt === null) continue;
+    if (!openers.has(entry.turnId)) {
+      openers.set(entry.turnId, entry.id);
+      openerOccurrence.set(entry.turnId, entry.versions[0].occurrences[0]);
+    }
+  }
+
+  return {
+    identities,
+    unkeyed,
+    openers,
+    openerOccurrence,
+    conflicts,
+    unclassified,
+    trimmedGenerations,
+    stats: {
+      occurrences: total,
+      identities: identities.size,
+      identical,
+      trimmed,
+      unclassified: unclassified.length,
+      conflicts: conflicts.length,
+      unkeyed: unkeyed.length,
+    },
+  };
+}
+
+/**
+ * Where each turn's opener stands relative to one projected view.
+ *
+ * A turn has an entry here whenever the WHOLE lineage has an opener for it, and `row` is that
+ * opener only when this view actually contains it. The two facts are kept apart on purpose: a
+ * generation slice that does not hold the opener still has to classify the prompt it does show
+ * as a steer, and still has to call the turn a prompted turn — it just has no opener row to point
+ * at. Collapsing them into "the opener is this row, else there is no opener" is what let a real
+ * steer become the first visible prompt of its own turn.
+ *
+ * @param {ReturnType<typeof buildMessageIdentity>} identity
+ * @param {Array<{ row: any, generation: number|null, locator: any }>} occurrences the projected rows
+ * @returns {Map<string, { row: any | null }>} turn id -> its lineage opener, row null when out of view
+ */
+export function openerRowsForView(identity, occurrences) {
+  // Compared by the ROW, not by the occurrence wrapper. `buildMessageIdentity` wraps every
+  // occurrence in a fresh object of its own, so a caller's own array never contains the same
+  // wrapper the identity table holds — comparing wrappers made every turn look like its opener was
+  // missing, and every prompt in it a steer. Each stored copy is a distinct row object, so the row
+  // is the thing that actually says "this is the copy the view contains".
+  const rows = new Set(occurrences.map((occurrence) => occurrence.row));
+  /** @type {Map<string, { row: any | null }>} */
+  const byTurn = new Map();
+  for (const [turnId, occurrence] of identity.openerOccurrence) {
+    byTurn.set(turnId, { row: rows.has(occurrence.row) ? occurrence.row : null });
+  }
+  return byTurn;
+}
+
+/**
+ * How many logical messages each generation's stored context holds.
+ *
+ * A generation's count is the number of identities with at least one occurrence in it, plus its
+ * own unkeyed rows. The counts OVERLAP and their sum is not the conversation: a message sealed
+ * into generation 0 and re-recorded in generation 1 is in both, which is what a stored context
+ * is. That is also why this cannot be derived from the catalog's per-file `messageCount` — that
+ * counts stored rows, so a message recorded twice in one file, and one written three times across
+ * a lineage, are both invisible to it.
+ *
+ * @param {ReturnType<typeof buildMessageIdentity>} identity
+ * @returns {Map<number, number>}
+ */
+export function logicalCountByGeneration(identity) {
+  /** @type {Map<number, number>} */
+  const counts = new Map();
+  const bump = (generation) => {
+    if (generation === null || generation === undefined) return;
+    counts.set(generation, (counts.get(generation) ?? 0) + 1);
+  };
+  for (const entry of identity.identities.values()) {
+    // One tick per generation the message appears in, however many copies that generation holds
+    // of it — a sealed snapshot and the active file can both store the same version.
+    const generations = new Set();
+    for (const version of entry.versions) {
+      for (const occurrence of version.occurrences) generations.add(occurrence.generation);
+    }
+    for (const generation of generations) bump(generation);
+  }
+  for (const occurrence of identity.unkeyed) bump(occurrence.generation);
+  return counts;
+}
+
+/**
+ * The rows one request should project, given the identity table and the generation it asked for.
+ *
+ * `null` generation is the whole lineage: every logical message appears once, at its first
+ * version, because the reader wants the original. A generation number is that generation's own
+ * stored context: every message that appears in it, at ITS version, including the trimmed
+ * placeholder. Those are different views of one message, not different messages — a generation can
+ * therefore hold a message the whole-lineage view already counted, which is why the generation
+ * counts are overlapping sets and their sum need not equal the lineage total.
+ *
+ * @param {ReturnType<typeof buildMessageIdentity>} identity
+ * @param {number|null} generation `null` for the whole lineage
+ * @returns {{ rows: Array<any>, occurrences: Array<{ row: any, generation: number|null, locator: any }>, versionOf: Map<string, number>, openerByTurn: Map<string, { row: any | null }> }}
+ */
+export function selectIdentityView(identity, generation) {
+  const occurrences = [];
+  /** logical id -> index into `versions` of the one being shown */
+  const versionOf = new Map();
+  for (const entry of identity.identities.values()) {
+    if (generation === null) {
+      const first = entry.versions[0];
+      occurrences.push(first.occurrences[0]);
+      versionOf.set(entry.id, 0);
+      continue;
+    }
+    // A generation view is that generation's own stored context: pick the version that file
+    // actually holds, and among its occurrences the one from that file — the rows of one version
+    // differ only in `history_artifact`, which is provenance about the generation.
+    let picked = null;
+    let pickedIndex = -1;
+    for (let v = 0; v < entry.versions.length && picked === null; v += 1) {
+      const version = entry.versions[v];
+      const hit = version.occurrences.find((o) => o.generation === generation);
+      if (hit !== undefined) { picked = hit; pickedIndex = v; }
+    }
+    if (picked === null) continue;
+    occurrences.push(picked);
+    versionOf.set(entry.id, pickedIndex);
+  }
+  // Rows with no usable id were never merged, so they pass through filtered like anything else.
+  for (const occ of identity.unkeyed) {
+    if (generation === null || (occ.generation ?? null) === generation) occurrences.push(occ);
+  }
+  return {
+    rows: occurrences.map((o) => o.row),
+    occurrences,
+    versionOf,
+    openerByTurn: openerRowsForView(identity, occurrences),
+  };
 }
 
 /**
@@ -911,6 +1684,19 @@ export function isHostOnlyMessage(message) {
 export function buildTrajectoryPayload(input) {
   const { session, rows, sizeBytes = 0, truncated = false } = input;
   const redact = input.redact ?? ((value) => value);
+  // The identity table the route already built over the whole lineage, so that a turn's opener is
+  // known even when the opener's own row falls outside the generation being projected. A caller
+  // that only holds a slice derives one from the rows it was given — the same function, so
+  // "how many messages is this" has one definition rather than one per caller.
+  const sliceOccurrences = input.identity
+    ? null
+    : rows.map((row) => ({
+      row,
+      generation: typeof row[ROW_GENERATION] === 'number' ? row[ROW_GENERATION] : null,
+      locator: null,
+    }));
+  const identity = input.identity ?? buildMessageIdentity(sliceOccurrences);
+  const openerByTurn = input.openerByTurn ?? openerRowsForView(identity, sliceOccurrences);
   /** @type {Array<Record<string, any>>} */
   const records = [];
   /** @type {Array<Record<string, any>>} */
@@ -1049,17 +1835,35 @@ export function buildTrajectoryPayload(input) {
       textTruncated: false,
     };
 
+    /**
+     * Where this record sits among the records its own source row produced.
+     *
+     * A message can expand into several records — an assistant turn yields its text, each of its
+     * thinking blocks and each of its tool calls — and `/api/trajectory/record` re-projects that one
+     * row to answer for one record. Without a position it would have to guess which of the row's
+     * records was meant, and a guess that picks the wrong thinking block shows the reader another
+     * block's reasoning as if it were this one.
+     */
+    let rowPos = 0;
+
     /** @param {Partial<Record<string, any>> & { kind: string, title: string, summary: string }} patch */
     const push = (patch) => {
       const record = {
         ...base,
         index: records.length + 1,
         relativeMs: timestamp === null || startedAt === null ? null : timestamp - startedAt,
-        text: null,
-        thinking: null,
-        arguments: null,
-        result: null,
-        error: null,
+        // Four presence flags, measured here and nowhere else. The values themselves stay on the
+        // record — the search reads them in this process — and `slimPayloadForWire()` is what stops
+        // them crossing to the page. Deciding it anywhere else would give the page a second answer
+        // to 「这条记录有没有正文」, and the two would disagree exactly the way they did before.
+        hasText: !isNilField(patch.text),
+        hasThinking: !isNilField(patch.thinking),
+        // Not `!isNilField(...)`: the page's own test for the 参数 tab is `!== null && !== undefined`,
+        // and an empty string is a present argument to it. Matching it here keeps the tab from
+        // appearing and disappearing when the payload changes shape.
+        hasArguments: patch.arguments !== null && patch.arguments !== undefined,
+        hasResult: !isNilField(patch.result),
+        rowPos: rowPos++,
         tokensBefore: null,
         producedBy: null,
         parentGeneration: null,
@@ -1067,6 +1871,12 @@ export function buildTrajectoryPayload(input) {
         parentRevision: null,
         ...patch,
       };
+      // The row summary the page used to assemble itself: `summary || text || toolName || title`.
+      // Measured over this machine's store, the `text` step never decided anything — `singleLine`
+      // had already reduced that text to nothing — and the `toolName`/`title` step decided it for
+      // 5 of 1287 records, all `system`. So the chain is folded here, once, and the page reads one
+      // field. It is a fold and not a replacement: a record that already has a summary keeps it.
+      if (!record.summary) record.summary = record.toolName || record.title || '';
       if (record.textTruncated) textTruncatedAny = true;
       records.push(record);
       turn.records.push(record);
@@ -1199,7 +2009,6 @@ export function buildTrajectoryPayload(input) {
         textTruncated: resultField.truncated,
         toolName,
         toolCallId,
-        error: source.isError === true && resultField.text ? resultField.text : null,
       });
       const pending = toolCallId ? toolCallsById.get(toolCallId) : null;
       if (pending && !pending.result) pending.result = record;
@@ -1226,14 +2035,20 @@ export function buildTrajectoryPayload(input) {
         // The first prompt of a turn is what opened it. Anything later arrived while the
         // turn was still running — a steer, redirecting work already under way.
         //
-        // Nothing in the session file marks this. Compared field by field, a steer is
-        // byte-identical to a typed prompt in role, stopReason, api, model, provider, tokens,
-        // producedBy, turnId and everything else; only id, timestamp and index differ. The
-        // signal available is position: measured across every turn that has one, its prompt
-        // sits at record 1 or 2 and never further in, so a user record past that point can
-        // only have been written mid-turn. That is an inference from ordering, not a fact
-        // the file asserts, and it is recorded as `steered` so the detail panel can say so.
-        const steered = turn.records.some((r) => r.kind === 'user');
+        // Nothing in the session file marks this, so it is decided from the lineage: the turn's
+        // opener is its earliest prompt across every generation, and this row is a steer exactly
+        // when it is not that row. Deciding it from the projected slice instead is what let a real
+        // steer become the first visible prompt of its own turn whenever the opener's generation
+        // was filtered away — and it counted as a new turn rather than as a redirect.
+        //
+        // The older fallback, kept for a turn the lineage says nothing about: position within the
+        // records seen so far. A steer is byte-identical to a typed prompt in role, stopReason,
+        // api, model, provider, tokens, producedBy, turnId and everything else; only id, timestamp
+        // and index differ, so position was the only signal available before the lineage was read.
+        const opener = openerByTurn.get(turnKey);
+        const steered = opener === undefined
+          ? turn.records.some((r) => r.kind === 'user')
+          : opener.row !== row;
         if (steered) stats.steers += 1; else stats.userMessages += 1;
         if (label === null) label = singleLine(redact(split.prompt), MAX_LABEL_CHARS);
         const promptField = clipField(redact(split.prompt), MAX_FIELD_CHARS);
@@ -1360,6 +2175,13 @@ export function buildTrajectoryPayload(input) {
       if (record.kind === 'toolCall' && typeof record.toolName === 'string'
         && USER_INPUT_TOOLS.has(record.toolName)) askedReader = true;
     }
+    // A turn somebody opened, and whether this view can show the row that opened it. The two are
+    // separate because a generation slice routinely holds a turn's steer without holding its
+    // opener: reading "no opener row" as "no opener" is what filed that turn as 其他 and lost it
+    // from the 对话 count while the reader was looking at a prompted turn.
+    const opener = turn.id === null ? undefined : openerByTurn.get(turn.id);
+    turn.openerInView = opener !== undefined && opener.row !== null;
+    turn.openerOutOfView = opener !== undefined && opener.row === null;
     turn.askedReader = askedReader;
     turn.closed = closed;
     // A turn that *contains* a checkpoint is still judged on what it did. A checkpoint used to be
@@ -1367,7 +2189,9 @@ export function buildTrajectoryPayload(input) {
     // rejoins the turn it interrupted, that would relabel every turn the runtime ever compacted
     // as a checkpoint and drop all of them out of the prompted count. Only a turn that holds
     // nothing but its checkpoint is one.
-    if (hasPrompt) {
+    // `hasPrompt` already covers the opener being in view — a prompt row in the records is what sets
+    // it — so only the out-of-view case adds anything here.
+    if (hasPrompt || turn.openerOutOfView) {
       turn.turnClass = 'prompt';
       turnsWithPrompt += 1;
       if (!closed) openTurns += 1;
@@ -1400,14 +2224,24 @@ export function buildTrajectoryPayload(input) {
   // to nothing. Both are fixed by reporting the chain rather than the catalog — the rejected ones
   // are still disclosed through `orphans`.
   const orphanFiles = new Set(orphans.map((orphan) => orphan.fileName));
+  const logicalPerGeneration = logicalCountByGeneration(identity);
+  // A copy per entry rather than the caller's objects: the count is ours to attach, and the
+  // catalog entries are read by other callers.
   const generations = (Array.isArray(input.generations) ? input.generations : [])
-    .filter((entry) => !orphanFiles.has(entry.fileName));
-  // `messages` counts what is on screen. When the whole lineage is stitched that already
-  // spans every generation; when the reader filtered to one, `messagesAll` keeps the
-  // session-wide number from silently shrinking to a single slice.
-  const messagesAll = generations.length > 1
-    ? generations.reduce((sum, entry) => sum + (Number.isInteger(entry.messageCount) ? entry.messageCount : 0), 0)
-    : rows.length;
+    .filter((entry) => !orphanFiles.has(entry.fileName))
+    .map((entry) => ({ ...entry, logicalMessageCount: logicalPerGeneration.get(entry.generation) ?? 0 }));
+  // `messages` counts what is on screen. `messagesAll` counts the conversation: one entry per
+  // LOGICAL message over the whole reachable lineage, so a message the store wrote into two
+  // generations is one message and a message the runtime trimmed into a new content version is
+  // still one message. It is therefore not a function of the generation the reader picked, which
+  // is the whole reason it exists — the previous definition summed the per-file counts the
+  // catalog recorded, so it counted the stored copies rather than the conversation, and a forked
+  // snapshot the lineage walk had already rejected still reached the total.
+  //
+  // `messageRowsAll` is the physical counterpart, kept because the two answer different questions
+  // and only one of them is "how many messages did this conversation have".
+  const messagesAll = identity.stats.identities + identity.stats.unkeyed;
+  const messageRowsAll = identity.stats.occurrences + identity.stats.unkeyed;
 
   return {
     session: {
@@ -1426,7 +2260,7 @@ export function buildTrajectoryPayload(input) {
       generations,
       orphans,
     },
-    stats: { ...stats, messagesAll },
+    stats: { ...stats, messagesAll, messageRowsAll },
     turns: turns.map((turn) => ({
       id: turn.id,
       index: turn.index,
@@ -1443,6 +2277,12 @@ export function buildTrajectoryPayload(input) {
       // turn count and the reply count.
       askedReader: turn.askedReader === true,
       closed: turn.closed === true,
+      // The turn's opener over the whole lineage: whether this view holds the row that opened it,
+      // and whether the lineage says the turn was opened at all while the row is somewhere else.
+      // `openerOutOfView` is why a `steer` record can be the only prompt a turn shows and the turn
+      // is still 对话 rather than 其他.
+      openerInView: turn.openerInView === true,
+      openerOutOfView: turn.openerOutOfView === true,
       records: turn.records,
     })),
   };
@@ -1557,6 +2397,67 @@ export function etagMatches(header, etag) {
 }
 
 /**
+ * The material a `/api/sessions` validator is derived from.
+ *
+ * The soundness of a 304 is not "this covers every input that could change the payload" — it is
+ * "this is built from the same values the payload is built from, in the same request". So the
+ * function takes the two things the payload is built from and nothing else, and the route builds
+ * both from one call: a tag derived from anything else is a tag about a different payload.
+ *
+ * `visible` contributes `dir|sizeBytes|lastActiveAt` — exactly what `describeSession` keys its
+ * descriptor cache on, so a matching tag means the descriptors this request would produce are the
+ * ones behind the tag the caller already holds. `titles` contributes the renamed-session case,
+ * which no file stat can see. `limit` is in it because `?limit=10` and `?limit=20` are different
+ * payloads and must not satisfy one another.
+ *
+ * What it does not claim: a session whose `manifest.json` appears after the walk listed it would
+ * change `startedAt` without changing anything here. That is already invisible for up to
+ * SESSION_CACHE_TTL_MS to the descriptor cache this reuses, so the bound is that cache's and not
+ * a new one. tests/verify-list-cache.mjs pins the TTL relationship that says so.
+ *
+ * @param {ReadonlyArray<{ dir: string, sizeBytes: number, lastActiveAt: number }>} visible
+ * @param {Map<string, { title: string | null, kind: string | null }>} titles
+ * @param {number} limit
+ * @returns {string}
+ */
+export function sessionsValidator(visible, titles, limit) {
+  const parts = ['limit=' + limit];
+  for (const entry of visible) {
+    const meta = titles.get(decodeSessionIdFromDirName(basename(entry.dir)));
+    const title = meta ? String(meta.title ?? "") : "";
+    const kind = meta ? String(meta.kind ?? "") : "";
+    const parent = meta ? String(meta.parent ?? "") : "";
+    // Injective by construction, which no delimiter is. Any character can occur inside a SQLite TEXT
+    // column — including the NUL this used to join on — so a title of "a\0b" beside a kind of "c" and
+    // a title of "a" beside a kind of "b\0c" produced byte-identical material: one ETag for two rows
+    // a reader can tell apart, and a 304 served for a payload the caller never held. Choosing a
+    // different separator cannot fix that, because no character is excluded from a TEXT value.
+    // JSON escapes the ambiguous characters, so the tuple's boundaries survive anything the store
+    // can return, and no field needs a second representation to be safe.
+    parts.push(JSON.stringify([entry.dir, entry.sizeBytes, entry.lastActiveAt, title, kind, parent]));
+  }
+  return parts.join("\n");
+}
+
+/**
+ * The part of a cache key that says WHAT is being asked, as opposed to which version of it.
+ *
+ * Everything after this — lineage, size, mtime, catalog bytes, binding — decides whether the answer
+ * went stale. Everything in it decides what the answer is. A newer version of one family must
+ * replace its predecessor; two families are two different questions and must not evict each other.
+ * Exported because `trajectoryCacheKey` builds the same prefix, and two copies of that expression
+ * would be free to drift.
+ *
+ * @param {string} dir
+ * @param {number | null | undefined} filter
+ * @returns {string}
+ */
+export function trajectoryCacheFamily(dir, filter) {
+  const gen = filter === null || filter === undefined ? 'all' : String(filter);
+  return `${dir}|gen=${gen}|`;
+}
+
+/**
  * The cache key for one rendered trajectory. Every component comes from a `stat`, a small
  * manifest/catalog file, or the already-resolved session binding — never from reading
  * `messages.jsonl`, which is the whole point: a matching key proves the file did not grow.
@@ -1583,8 +2484,7 @@ export function trajectoryCacheKey(entry, identity, binding, filter) {
     .join(',');
   // The requested slice is part of the answer too: the same session stitched and unfiltered is
   // two different bodies and must never share an entry.
-  const gen = filter === null || filter === undefined ? 'all' : String(filter);
-  return `${entry.dir}|gen=${gen}|${lineage}|${entry.sizeBytes}|${entry.lastActiveAt}|${identity.catalogBytes ?? ''}|${bind}`;
+  return `${trajectoryCacheFamily(entry.dir, filter)}${lineage}|${entry.sizeBytes}|${entry.lastActiveAt}|${identity.catalogBytes ?? ''}|${bind}`;
 }
 /**
  * The `?since=` cursor, or null when there is not a usable one.
@@ -1655,6 +2555,26 @@ export function buildDeltaPayload(payload, since) {
     }
   }
   if (since > upTo) return null;
+  // Which record the cursor is pointing AT, so the page can tell whether the numbering it is
+  // holding is still the numbering this tail was cut from.
+  //
+  // The cursor is `record.index`, and the identity layer can renumber a payload that is otherwise
+  // untouched: a message arriving that is a newer version of an earlier one suppresses that
+  // earlier copy, and every record after it shifts down by one. A tail cut at the old number then
+  // lands in the middle of the wrong turn, with no error anywhere — which is why the delta says
+  // what it assumed rather than leaving the page to guess.
+  //
+  // `null` for index 0 and for a cursor that names no record, which is the same thing the page
+  // treats as 「there is nothing before here to have moved」.
+  let basedOn = null;
+  for (const turn of turns) {
+    const all = turn && Array.isArray(turn.records) ? turn.records : [];
+    for (const record of all) {
+      if (record && record.index === since) {
+        basedOn = { index: since, id: record.id === undefined ? null : record.id };
+      }
+    }
+  }
   const tail = [];
   // `records` counts what is NEW, not what travels. A turn that ships whole with 300 records
   // contributes 1 here. The page reads `delta.upTo` for its next cursor and never reads this
@@ -1675,12 +2595,19 @@ export function buildDeltaPayload(payload, since) {
     session: payload.session,
     stats: payload.stats,
     turns: tail,
-    delta: { since, upTo, records },
+    delta: { since, upTo, records, basedOn },
   };
 }
 
 /**
- * @typedef {{ rows: Array<Record<string, any>>, skipped: number, size: number, read: number, empty: boolean, truncated: boolean }} ParsedRows
+ * One generation file, parsed once.
+ *
+ * `locators` is parallel to `rows` and is what makes releasing `rows` safe: each entry says which
+ * file the line came from, where in it, and what it hashed to, which is everything `/raw` needs to
+ * fetch that one line again.
+ *
+ * @typedef {{ filePath: string, start: number, end: number, digest: string }} LineLocator
+ * @typedef {{ rows: Array<Record<string, any>>, locators: Array<LineLocator>, skipped: number, size: number, read: number, empty: boolean, truncated: boolean }} ParsedRows
  */
 
 /**
@@ -1766,7 +2693,75 @@ export function createParsedRowsCache(budget) {
 }
 
 /**
- * One generation file's rows, from the cache when the filesystem still agrees with the key.
+ * LRU over rendered trajectory bodies, bounded by entries.
+ *
+ * The bound alone is not enough. `trajectoryCacheKey` carries the active file's size and mtime, so
+ * a session that is still being written to mints a NEW key every time it grows — and every miss
+ * stores another complete body. A plain FIFO therefore keeps four versions of the SAME question
+ * alive, three of which no request can reach any more: `/raw` resolves the current key, and the
+ * page's next poll produces a newer one. Measured on a 9.1 MB session polled every 8s, the cache
+ * held four bodies (49.6 MB) after four polls; at this machine's 68 MB body that is three dead
+ * copies.
+ *
+ * So an entry carries the family it answers for — the session directory plus the requested slice —
+ * and storing a new one drops its predecessor. Everything that changes the ANSWER stays in the
+ * key; everything that only marks it stale stays in the family.
+ *
+ * Different `?generation=` slices are different families and each keeps its own entry, bounded by
+ * `limit` as before.
+ *
+ * @param {number} limit
+ */
+export function createTrajectoryCache(limit) {
+  /** @type {Map<string, { at: number, family: string, value: any }>} */
+  const entries = new Map();
+  return {
+    get size() { return entries.size; },
+    /**
+     * @param {string} key
+     * @returns {any | null}
+     */
+    get(key) {
+      const hit = entries.get(key);
+      if (hit === undefined) return null;
+      // Re-reading is the only signal that an entry is still hot, so it refreshes recency.
+      entries.delete(key);
+      entries.set(key, hit);
+      return hit.value;
+    },
+    /**
+     * @param {string} key
+     * @param {string} family the (session, slice) this answers for; a newer version of the same
+     *   family replaces the older one instead of stacking beside it
+     * @param {any} value
+     */
+    set(key, family, value) {
+      const previous = entries.get(key);
+      if (previous !== undefined) entries.delete(key);
+      entries.set(key, { at: Date.now(), family, value });
+      for (const [existingKey, existing] of entries) {
+        if (existingKey !== key && existing.family === family) entries.delete(existingKey);
+      }
+      while (entries.size > limit) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
+    },
+    clear() {
+      entries.clear();
+    },
+  };
+}
+
+/**
+ * One generation file, parsed once, from the cache when the caller says the file can be reused.
+ *
+ * `cacheable` is the whole of what step 2 changed, and it is not a tuning knob: a cache entry
+ * keyed on path+size+mtime for a file that grows between polls cannot be hit, because the caller
+ * only gets here after a key carrying that same size and mtime already missed. The active file is
+ * therefore parsed every time and retained never, and `/raw` finds its lines from the locators
+ * instead. Sealed generations still go in, because for those the stat really is constant.
  *
  * Extracted from the route so a test can run the real step twice and compare: a cache hit
  * that is even slightly different from a cold read is the one failure this cache may not
@@ -1778,9 +2773,11 @@ export function createParsedRowsCache(budget) {
  * @param {ReturnType<typeof createParsedRowsCache>} cache
  * @param {string} filePath
  * @param {number} limit
+ * @param {{ cacheable?: boolean }} [options]
  * @returns {Promise<ParsedRows>}
  */
-export async function loadParsedRows(cache, filePath, limit) {
+export async function loadParsedRows(cache, filePath, limit, options) {
+  const cacheable = options === undefined || options.cacheable !== false;
   // Stat for the key rather than trusting the catalog, for the same reason the read limit is
   // not taken from it: the active file grows past its recorded size between polls. If the file
   // changes between this stat and readHead the entry ends up keyed on a size it does not
@@ -1789,21 +2786,33 @@ export async function loadParsedRows(cache, filePath, limit) {
   // different key.
   const current = await stat(filePath);
   const key = parsedRowsKey(filePath, current.size, current.mtimeMs, limit);
-  const hit = cache.get(key);
-  if (hit !== null) return hit;
+  if (cacheable) {
+    const hit = cache.get(key);
+    if (hit !== null) return hit;
+  }
 
   const head = await readHead(filePath, limit);
-  const parsed = parseMessagesJsonl(head.text);
+  const parsed = parseMessagesJsonl(head.buffer);
+  // Built complete rather than completed by the caller: one locator per row is 36,527 objects on a
+  // session this size, and spreading each of them into a second object to add a field the parse
+  // already had in hand cost more than the digests do.
+  const locators = parsed.spans.map(([start, end]) => ({
+    filePath,
+    start,
+    end,
+    digest: lineDigest(head.buffer.subarray(start, end)),
+  }));
   const value = {
     rows: parsed.rows,
+    locators,
     skipped: parsed.skipped,
     size: head.size,
     read: head.read,
-    empty: head.text === '',
+    empty: head.buffer.length === 0,
     // Truncated means our cap cut the read, nothing else.
     truncated: truncatedByCap(head.size, limit),
   };
-  cache.set(key, value, Math.ceil(head.size * PARSED_ROWS_HEAP_PER_SOURCE_BYTE));
+  if (cacheable) cache.set(key, value, Math.ceil(head.size * PARSED_ROWS_HEAP_PER_SOURCE_BYTE));
   return value;
 }
 
@@ -1859,7 +2868,8 @@ export async function start(context) {
   const redact = createRedactor(secrets);
   /** @type {Buffer | null} */
   let clientEntry = null;
-  let listCache = { at: 0, entries: null };
+  /** @type {{ at: number, candidates: Awaited<ReturnType<typeof collectSessionCandidates>> | null }} */
+  let listCache = { at: 0, candidates: null };
   /** @type {Map<string, { at: number, value: any }>} */
   const descriptorCache = new Map();
   /**
@@ -1870,15 +2880,49 @@ export async function start(context) {
    * but is only ever read for one record at a time, so keeping it beside the body means
    * the poll transfers the small payload and the record that gets opened still costs
    * nothing extra.
-   * @type {Map<string, { at: number, etag: string, body: string, raws: Map<number, number>, rows: Array<Record<string, any>> }>}
+   * @type {ReturnType<typeof createTrajectoryCache>}
    */
-  const trajectoryCache = new Map();
+  const trajectoryCache = createTrajectoryCache(TRAJECTORY_CACHE_ENTRIES);
   /**
-   * Parsed generation rows, keyed by path+size+mtime+limit. Beside trajectoryCache, not
-   * inside it: a whole-session hit still short-circuits before this is touched at all, so
-   * the two caches never answer for each other. Pinned by tests/verify-parsed-rows.mjs.
+   * Parsed generation rows, keyed by path+size+mtime+limit, and now holding sealed generations
+   * only — `loadParsedRows` is called with `cacheable: false` for the file being appended to.
+   * Beside trajectoryCache, not inside it: a whole-session hit still short-circuits before this is
+   * touched at all, so the two caches never answer for each other.
+   * Pinned by tests/verify-parsed-rows.mjs.
    */
   const parsedRows = createParsedRowsCache(PARSED_ROWS_CACHE_BYTES);
+
+  // Derived artifacts, under the runtime's own data dir and nowhere else. The session history is
+  // read-only input and the plugin package installs onto every reader's machine, so neither is a
+  // place to write. Held per runtime instance rather than as module state, so two runtimes in one
+  // process cannot share a root.
+  //
+  // Only the search segments live here. There was a second store under `index/`, written on every
+  // publish and never read by anything; it is gone, and directories it already wrote are left
+  // alone — nothing consults them, and deleting them is a migration that does not belong in the
+  // same change as stopping the writes.
+  const artifactRoot = join(context.dataDir, 'trajectory-artifacts');
+  const segmentStore = createSegmentStore(join(artifactRoot, 'search'));
+
+  /**
+   * A name for one session's artifacts, derived rather than quoted.
+   *
+   * Hashed because the key becomes a DIRECTORY NAME: a session id is not something to scatter across
+   * a filesystem, and two stores on one machine can hold the same id for different sessions, so the
+   * store's own path has to be part of it. The two are joined by a newline CHARACTER at runtime,
+   * written here as an escape rather than as the byte — a literal NUL here made this file binary to
+   * every text tool reading it, and the guard that says so is the one that caught it.
+   *
+   * @param {string} dir
+   * @param {string} sessionId
+   */
+  const searchSessionKey = (dir, sessionId) =>
+    createHash('sha256').update(`${dir}\n${sessionId}`).digest('hex').slice(0, 32);
+
+  /**
+   * @param {number | null} filter
+   */
+  const searchViewKey = (filter) => (filter === null || filter === undefined ? 'all' : `g${filter}`);
 
   const loadClientEntry = async () => {
     if (clientEntry) return clientEntry;
@@ -1889,10 +2933,10 @@ export async function start(context) {
 
   const listEntries = async () => {
     const now = Date.now();
-    if (listCache.entries && now - listCache.at < LIST_CACHE_TTL_MS) return listCache.entries;
-    const entries = await collectSessionEntries(location.sessionsRoot);
-    listCache = { at: now, entries };
-    return entries;
+    if (listCache.candidates && now - listCache.at < LIST_CACHE_TTL_MS) return listCache.candidates;
+    const candidates = await collectSessionCandidates(location.sessionsRoot);
+    listCache = { at: now, candidates };
+    return candidates;
   };
 
   /**
@@ -1905,6 +2949,14 @@ export async function start(context) {
    * @type {{ at: number, key: string, map: Map<string, { title: string | null, kind: string | null }> }}
    */
   let titleCache = { at: 0, key: '', map: new Map() };
+  /**
+   * The last list body, kept under the tag it was built for. One entry, not a cache: the tag is
+   * recomputed per request and a mismatch simply means the list moved, which is the common case
+   * while the reader is working. Its job is the page that arrives with no validator — first load
+   * or a fresh tab — so the descriptors behind the previous answer can be reused instead of read.
+   * @type {{ material: string, body: string | null }}
+   */
+  let sessionsBody = { material: '', body: null };
   /** @param {readonly string[]} ids */
   const sessionTitles = async (ids) => {
     const key = ids.join('');
@@ -1965,6 +3017,18 @@ export async function start(context) {
    * Diagnostics: report what this Node process can actually observe about its own session
    * identity. Names and structure only — no environment *values* are returned unless the
    * value is itself a session id, which is the one fact this route exists to settle.
+   *
+   * The three free-form fields below are the only ones in this route that are not a basename, a
+   * count or a flag, and each of them breaks the promise above the same way: a SQLite message
+   * carries the database it could not open, and a stack frame carries every directory above it.
+   * Both are absolute paths on the reader's machine, on exactly the failure paths this route
+   * exists to report.
+   *
+   * Two passes, in this order, and then the clip. `redact` knows the three store locations but
+   * only in the spelling it was given; `scrubAbsolutePaths` is spelling-agnostic and blunts
+   * anything absolute, which is what a stack frame needs and what session content must never get.
+   * Clipping LAST is the part that is easy to get wrong: clipping first can cut a path in half
+   * and leave a drive-qualified fragment standing.
    */
       const handleRuntime = async (response) => {
    let diagError = null;
@@ -1976,7 +3040,7 @@ export async function start(context) {
       mod = await import('node:sqlite');
       sqlite.available = typeof mod.DatabaseSync === 'function';
     } catch (error) {
-      sqlite.error = String(/** @type {any} */ (error)?.message ?? error).slice(0, 200);
+      sqlite.error = scrubAbsolutePaths(redact(String(/** @type {any} */ (error)?.message ?? error))).slice(0, 200);
     }
     if (sqlite.available) {
       // Name only — this route must never hand the browser a filesystem location.
@@ -1991,7 +3055,7 @@ export async function start(context) {
         ).get();
         sqlite.conversationCount = count ? toNumber(count.n) : null;
       } catch (error) {
-        sqlite.queryError = String(/** @type {any} */ (error)?.message ?? error).slice(0, 240);
+        sqlite.queryError = scrubAbsolutePaths(redact(String(/** @type {any} */ (error)?.message ?? error))).slice(0, 240);
       } finally {
         // A schema mismatch is the case this route exists to report, and it is exactly the case
         // where `prepare` throws — so closing inside the try left the handle waiting for GC.
@@ -2014,15 +3078,19 @@ export async function start(context) {
       sessionRootExists: existsSync(location.sessionsRoot),
     });
    } catch (error) {
-    diagError = String(/** @type {any} */ (error)?.stack ?? error).slice(0, 600);
+    diagError = scrubAbsolutePaths(redact(String(/** @type {any} */ (error)?.stack ?? error))).slice(0, 600);
     sendJson(response, 200, { diagError });
    }
   };
 
-  const handleSessions = async (response, url) => {    const limit = normalizeLimit(url.searchParams.get('limit'), 20, 1, 50);
+  const handleSessions = async (response, url) => {
+    const limit = normalizeLimit(url.searchParams.get('limit'), 20, 1, 50);
     let entries;
     try {
-      entries = await listEntries();
+      // The picker still sees only the most recent sessions. The id index beside it is what
+      // `handleTrajectory` resolves explicit ids against, and it is deliberately not what the
+      // picker is built from — widening the list is a separate decision about the UI.
+      entries = (await listEntries()).recentEntries;
     } catch (error) {
       context.logger.error('miniapp.trajectory.read_error', { reason: 'root_unreadable', code: errorCode(error) });
       sendError(response, 503, 'trajectory_unavailable', '未找到本地会话数据目录');
@@ -2032,27 +3100,46 @@ export async function start(context) {
       sendError(response, 503, 'trajectory_unavailable', '未找到本地会话数据目录');
       return;
     }
-    const described = [];
     const visible = entries.slice(0, limit);
     // Real titles from the runtime database; sub-agent and cron sessions get a kind badge so
     // the picker never presents them as if they were the user's conversation.
     const titles = await sessionTitles(
       visible.map((entry) => decodeSessionIdFromDirName(basename(entry.dir))).filter(Boolean),
     );
-    for (const entry of visible) {
-      try {
-        const descriptor = await describeSession(entry);
-        const meta = titles.get(decodeSessionIdFromDirName(basename(entry.dir)));
-        if (meta) {
-          if (meta.title) descriptor.label = meta.title;
-          descriptor.sessionKind = meta.kind;
-        }
-        described.push(descriptor);
-      } catch (error) {
-        context.logger.warn('miniapp.trajectory.read_error', { reason: 'describe_failed', code: errorCode(error) });
-      }
+
+    // Built from the same two values the payload below is built from, and computed before any
+    // descriptor work — which is what lets an unchanged list answer without building it.
+    const etag = weakETag(sessionsValidator(visible, titles, limit));
+    const requestEtag = response.req && response.req.headers ? response.req.headers['if-none-match'] : null;
+    if (etagMatches(requestEtag, etag)) {
+      sendJsonBody(response, 304, '', { etag, revalidate: true });
+      return;
     }
-    sendJson(response, 200, { sessions: described.map(stripInternalFields) });
+
+    // Same shape as the trajectory route's cache-hit branch: a page that arrives without a
+    // validator — first load, a fresh tab — still gets bytes it does not have to cause a rebuild
+    // to produce.
+    let body = sessionsBody.material === etag ? sessionsBody.body : null;
+    if (body === null) {
+      const described = [];
+      for (const entry of visible) {
+        try {
+          const descriptor = await describeSession(entry);
+          const meta = titles.get(decodeSessionIdFromDirName(basename(entry.dir)));
+          if (meta) {
+            if (meta.title) descriptor.label = meta.title;
+            descriptor.sessionKind = meta.kind;
+            descriptor.sessionParentId = meta.parent;
+          }
+          described.push(descriptor);
+        } catch (error) {
+          context.logger.warn('miniapp.trajectory.read_error', { reason: 'describe_failed', code: errorCode(error) });
+        }
+      }
+      body = JSON.stringify({ sessions: described.map(stripInternalFields) });
+      sessionsBody = { material: etag, body };
+    }
+    sendJsonBody(response, 200, body, { etag, revalidate: true });
   };
 
   /**
@@ -2063,14 +3150,15 @@ export async function start(context) {
    * @param {URL} url
    */
   const resolveTrajectoryRequest = async (url) => {
-    let entries;
+    let candidates;
     try {
-      entries = await listEntries();
+      candidates = await listEntries();
     } catch (error) {
       context.logger.error('miniapp.trajectory.read_error', { reason: 'root_unreadable', code: errorCode(error) });
       return { ok: false, status: 503, code: 'trajectory_unavailable', message: '未找到本地会话数据目录' };
     }
-    if (entries.length === 0) {
+    const entries = candidates.recentEntries;
+    if (entries.length === 0 && candidates.byDecodedId.size === 0) {
       return { ok: false, status: 503, code: 'trajectory_unavailable', message: '未找到本地会话数据目录' };
     }
     const requested = url.searchParams.get('session');
@@ -2105,18 +3193,59 @@ export async function start(context) {
       }
       if (!entry) entry = entries[0];
     } else {
-      const matched = [];
-      for (const candidate of entries) {
-        const identity = await readSessionIdentity(candidate.dir);
-        if (identity.id === requested || basename(candidate.dir) === requested) {
-          matched.push({ entry: candidate, identity });
-          break;
+      // Two ways in, and the order matters.
+      //
+      // Fast path: the id was decoded from a directory name during the walk, so the directory is
+      // already known and no scanning is needed. This is what makes a session outside the recent
+      // 30 reachable at all — before this, the only directories this branch could see were the 30
+      // the picker shows, so 116 of 146 sessions on this machine answered 404 to their own id.
+      //
+      // The decoded name is still only a claim. `readSessionIdentity` prefers `manifest.sessionId`,
+      // so a directory whose name disagrees with its manifest must not be served under the
+      // requested id; it falls through to the slow path instead, which re-checks every candidate.
+      const fastPath = candidates.byDecodedId.get(requested);
+      let picked = null;
+      if (fastPath) {
+        // Duplicates are kept as a list rather than collapsed, because collapsing them with
+        // `Map.set` would make the answer depend on `readdir` order. Here the manifests decide.
+        const verified = [];
+        for (const candidate of fastPath) {
+          const candidateIdentity = await readSessionIdentity(candidate.dir);
+          if (candidateIdentity.id === requested) verified.push({ entry: candidate, identity: candidateIdentity });
+        }
+        if (verified.length === 1) picked = verified[0];
+        else if (verified.length > 1) {
+          // Two directories both claim this id. Rather than pick one by directory order, fall
+          // through to the slow path, which keeps the original scan-and-compare behaviour.
+          context.logger.warn('miniapp.trajectory.read_error', { reason: 'ambiguous_session_id', code: requested });
         }
       }
-      if (matched.length === 0) {
-        return { ok: false, status: 404, code: 'session_not_found', message: '找不到该会话' };
+
+      if (!picked) {
+        const matched = [];
+        for (const candidate of entries) {
+          const candidateIdentity = await readSessionIdentity(candidate.dir);
+          if (candidateIdentity.id === requested || basename(candidate.dir) === requested) {
+            matched.push({ entry: candidate, identity: candidateIdentity });
+            break;
+          }
+        }
+        if (matched.length === 0) {
+          // The scan budget stopped the walk before this id could be seen. That is not the same
+          // answer as "no such session", and reporting it as one is how 400 became a correctness
+          // boundary instead of a resource guard.
+          if (candidates.truncated) {
+            return {
+              ok: false, status: 404, code: 'session_scan_budget_exhausted',
+              message: '会话数量超出本次扫描预算，请重试或缩小会话目录范围',
+            };
+          }
+          return { ok: false, status: 404, code: 'session_not_found', message: '找不到该会话' };
+        }
+        entry = matched[0].entry;
+      } else {
+        entry = picked.entry;
       }
-      entry = matched[0].entry;
     }
 
     const identity = await readSessionIdentity(entry.dir);
@@ -2142,6 +3271,173 @@ export async function start(context) {
     return { ok: true, entry, binding, identity, generations, filter, cacheKey: trajectoryCacheKey(entry, identity, binding, filter) };
   };
 
+  /**
+   * One session's lineage, and every stored row of every generation that belongs to it.
+   *
+   * The ONE place the lineage is walked. Two readers need it and they must not be allowed to walk it
+   * separately: the payload answers from the whole chain, and a search answers from the same chain
+   * with the active generation read fresh. A second walk would be a second answer to "which files
+   * are this session made of", and the two could disagree about a generation that rotated between
+   * two requests.
+   *
+   * `files` is the same chain as a table the index and the search segments address: one entry per
+   * generation, carrying the identity that decides whether a stored artifact may be reused. It holds
+   * the resolved path so a record can be matched to its file exactly; the index strips it before
+   * anything is written.
+   *
+   * Throws rather than answering: an unreadable lineage is reported by the caller, which is the only
+   * place that knows how to phrase it.
+   *
+   * @param {{ dir: string }} entry
+   * @param {Array<any>} generations
+   */
+  const collectLineage = async (entry, generations) => {
+    const artifactByFile = new Map(generations.map((candidate) => [candidate.fileName, candidate]));
+    // history-catalog.json is written by the runtime when it rotates generations, so a session
+    // that has never compacted does not have one and its `generations` list is empty. The active
+    // file is real regardless, and `probe` below already synthesises an artifact for it; reuse
+    // that same shape here instead of rejecting the whole session with artifact_path_rejected.
+    const artifactFor = (fileName) => artifactByFile.get(fileName)
+      ?? (fileName === 'messages.jsonl'
+        ? {
+          fileName: 'messages.jsonl',
+          active: true,
+          generation: null,
+          kind: 'messages',
+          byteLength: null,
+          messageCount: null,
+          revision: null,
+        }
+        : null);
+    /** @type {Map<number, { marker: any, head: string }>} */
+    const probed = new Map();
+    const probe = async (generation) => {
+      const artifact = generation === null
+        ? { fileName: 'messages.jsonl', active: true, byteLength: null }
+        : generations.find((candidate) => candidate.generation === generation) ?? null;
+      if (artifact === null) return null;
+      if (generation !== null && artifact.active) return null;
+      const filePath = resolveArtifactPath(entry.dir, artifact);
+      if (filePath === null) return null;
+      if (probed.has(artifact.fileName)) return probed.get(artifact.fileName);
+      const head = await readHead(filePath, GENERATION_PROBE_BYTES);
+      const result = { fileName: artifact.fileName, marker: readGenerationMarker(head.text) };
+      probed.set(artifact.fileName, result);
+      return result;
+    };
+
+    const lineage = await walkLineage({ generations }, probe);
+    if (lineage.chain.length === 0) throw new Error('lineage_empty');
+    const activeFileName = lineage.chain[lineage.chain.length - 1].fileName;
+
+    /** @type {Array<{ row: Record<string, any>, generation: number | null, locator: any }>} */
+    const occurrences = [];
+    /** @type {Array<any>} */
+    const files = [];
+    let skippedTotal = 0;
+    let truncated = false;
+    let readBytes = 0;
+    for (const link of lineage.chain) {
+      const artifact = artifactFor(link.fileName);
+      const filePath = artifact === null ? null : resolveArtifactPath(entry.dir, artifact);
+      if (filePath === null) throw new Error('artifact_path_rejected');
+      // Bound the read by our own cap only. The catalog's recorded sizes are a snapshot and the
+      // active messages.jsonl keeps being appended to after the catalog was written, so using
+      // them as a read limit both dropped records that were really on disk and — because the read
+      // then stopped short of the file — made `head.read < head.size` report "file too large" for
+      // a file that was merely newer than its catalog entry. `readHead` already clamps to the real
+      // stat size, so MAX_MESSAGE_BYTES bounds memory on its own.
+      const limit = MAX_MESSAGE_BYTES;
+      /** @type {ParsedRows} */
+      let parsedFile;
+      try {
+        parsedFile = await loadParsedRows(parsedRows, filePath, limit, { cacheable: link.fileName !== activeFileName });
+      } catch {
+        throw new Error('messages_unreadable');
+      }
+      // Kept as a flag on the cached value rather than a log line at the read site: a file that
+      // parsed empty once will parse empty every time, and a hit must still say so.
+      if (parsedFile.empty) {
+        context.logger.warn('miniapp.trajectory.read_error', { reason: 'empty_messages' });
+      }
+      if (parsedFile.truncated) truncated = true;
+      readBytes += parsedFile.read;
+      skippedTotal += parsedFile.skipped;
+      // The identity a stored index or search segment is reused under. Read before the rows so a
+      // file that cannot be stat()ed is a missing entry rather than a wrong one — a file that
+      // cannot be stat()ed was not read either.
+      let size = 0;
+      let mtimeMs = 0;
+      try {
+        const fileStat = await stat(filePath);
+        size = fileStat.size;
+        mtimeMs = fileStat.mtimeMs;
+      } catch {
+        throw new Error('messages_unreadable');
+      }
+      files.push({
+        fileName: link.fileName,
+        generation: link.generation,
+        size,
+        mtimeMs,
+        revision: typeof artifact.revision === 'string' ? artifact.revision : null,
+        // Per generation, not only summed into the session-level flag: an artifact built from this
+        // generation has to be able to tell that it covers a prefix of the file rather than all of
+        // it, and the only place that fact exists is here.
+        truncated: parsedFile.truncated === true,
+        filePath,
+      });
+      // A sealed file's rows are shared with every other request that read it; the active file's
+      // are this request's alone and are released below. Either way stamping the generation is the
+      // only write, and one filePath always maps to one generation, so it is idempotent.
+      // Pinned by tests/verify-parsed-rows.mjs.
+      for (let index = 0; index < parsedFile.rows.length; index += 1) {
+        const row = parsedFile.rows[index];
+        row[ROW_GENERATION] = link.generation;
+        // One entry per row, holding where that row's line was read from and what it hashed to —
+        // enough for `/raw` to go back to one line without any of the parsed rows still being
+        // alive, which is what lets the rows be released once the payload is serialized.
+        occurrences.push({ row, generation: link.generation, locator: parsedFile.locators[index] });
+      }
+    }
+    return {
+      lineage,
+      occurrences,
+      files,
+      skippedTotal,
+      truncated,
+      readBytes,
+      activeFileName,
+      activeArtifact: artifactFor(activeFileName),
+      artifactFor,
+    };
+  };
+
+  /**
+   * Why a lineage could not be collected. Named here so the caller reports the same reason the
+   * walk used to, from one table instead of two blocks of inline sends.
+   * @param {unknown} error
+   */
+  const lineageFailure = (error) => {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason === 'lineage_unreadable') {
+      context.logger.error('miniapp.trajectory.read_error', { reason: 'lineage_unreadable' });
+      return '会话数据暂时无法读取';
+    }
+    if (reason === 'artifact_path_rejected') {
+      context.logger.error('miniapp.trajectory.read_error', { reason: 'artifact_path_rejected', code: errorCode(null) });
+      return '会话数据暂时无法读取';
+    }
+    if (reason === 'messages_unreadable') {
+      context.logger.error('miniapp.trajectory.read_error', { reason: 'messages_unreadable', code: errorCode(error) });
+      return '会话数据暂时无法读取';
+    }
+    // `lineage_empty` and anything unforeseen both land here, and both are the same answer to the
+    // reader: there is nothing to show. The reason is kept for the log, never for the page.
+    context.logger.error('miniapp.trajectory.read_error', { reason: `lineage_${reason}` });
+    return '会话数据暂时无法读取';
+  };
+
   const handleTrajectory = async (response, url) => {
     const ctx = await resolveTrajectoryRequest(url);
     if (!ctx.ok) {
@@ -2163,116 +3459,37 @@ export async function start(context) {
       // cursor carries the validator it was taken against, so a request that reaches this
       // line with a cursor means the session changed — which is the branch below. Cutting
       // a tail out of a cached payload would also mean holding that payload in memory, and
-      // this cache deliberately does not: it holds the serialized bytes and the rows /raw
-      // needs, not the object graph the bytes came from.
+      // this cache deliberately does not: it holds the serialized bytes and the locators
+      // /raw needs, not the object graph the bytes came from.
       sendJsonBody(response, 200, cached.body, { etag, revalidate: true });
       return;
     }
 
-    // Walk the lineage from the active file outward. A small head of each candidate is enough
-    // to learn which generation it claims to be, so only the files that actually belong to the
-    // chain get parsed in full.
-    const artifactByFile = new Map(generations.map((candidate) => [candidate.fileName, candidate]));
-    // history-catalog.json is written by the runtime when it rotates generations, so a session
-    // that has never compacted does not have one and its `generations` list is empty. The active
-    // file is real regardless, and `probe` below already synthesises an artifact for it; reuse
-    // that same shape here instead of rejecting the whole session with artifact_path_rejected.
-    const activeArtifactFor = (fileName) => artifactByFile.get(fileName)
-      ?? (fileName === 'messages.jsonl'
-        ? {
-          fileName: 'messages.jsonl',
-          active: true,
-          generation: null,
-          kind: 'messages',
-          byteLength: null,
-          messageCount: null,
-          revision: null,
-        }
-        : null);
-    /** @type {Map<number, { marker: any, head: string }>} */
-    const probed = new Map();
-    const probe = async (generation) => {
-      const artifact = generation === null
-        ? { fileName: 'messages.jsonl', active: true, byteLength: identity.catalogBytes }
-        : generations.find((candidate) => candidate.generation === generation) ?? null;
-      if (artifact === null) return null;
-      if (generation !== null && artifact.active) return null;
-      const filePath = resolveArtifactPath(entry.dir, artifact);
-      if (filePath === null) return null;
-      if (probed.has(artifact.fileName)) return probed.get(artifact.fileName);
-      const head = await readHead(filePath, GENERATION_PROBE_BYTES);
-      const result = { fileName: artifact.fileName, marker: readGenerationMarker(head.text) };
-      probed.set(artifact.fileName, result);
-      return result;
-    };
-
-    /** @type {{ chain: Array<{ generation: number, fileName: string }>, orphans: Array<{ generation: number, fileName: string }> }} */
-    let lineage;
+    // The lineage is walked in ONE place (`collectLineage`), because two readers need it and a
+    // second walk would be a second answer to "which files is this session made of".
+    let walked;
     try {
-      lineage = await walkLineage({ generations }, probe);
+      walked = await collectLineage(entry, generations);
     } catch (error) {
-      context.logger.error('miniapp.trajectory.read_error', { reason: 'lineage_unreadable', code: errorCode(error) });
-      sendError(response, 500, 'trajectory_unreadable', '会话数据暂时无法读取');
+      sendError(response, 500, 'trajectory_unreadable', lineageFailure(error));
       return;
     }
-    if (lineage.chain.length === 0) {
-      sendError(response, 500, 'trajectory_unreadable', '会话数据暂时无法读取');
-      return;
+    const { lineage, occurrences, files, truncated, readBytes, activeFileName, activeArtifact } = walked;
+    if (walked.skippedTotal > 0) {
+      context.logger.warn('miniapp.trajectory.parse_warn', { skipped: walked.skippedTotal });
     }
-    const activeFileName = lineage.chain[lineage.chain.length - 1].fileName;
-    const activeArtifact = activeArtifactFor(activeFileName);
-
-    // Concatenate oldest → newest, which is the order the conversation actually happened in.
-    /** @type {Array<Record<string, any>>} */
-    const rows = [];
-    let skippedTotal = 0;
-    let truncated = false;
-    let readBytes = 0;
-    for (const link of lineage.chain) {
-      const artifact = activeArtifactFor(link.fileName);
-      const filePath = artifact === null ? null : resolveArtifactPath(entry.dir, artifact);
-      if (filePath === null) {
-        context.logger.error('miniapp.trajectory.read_error', { reason: 'artifact_path_rejected', code: errorCode(null) });
-        sendError(response, 500, 'trajectory_unreadable', '会话数据暂时无法读取');
-        return;
-      }
-      // Bound the read by our own cap only. The catalog's recorded sizes are a snapshot and the
-      // active messages.jsonl keeps being appended to after the catalog was written, so using
-      // them as a read limit both dropped records that were really on disk and — because the read
-      // then stopped short of the file — made `head.read < head.size` report "file too large" for
-      // a file that was merely newer than its catalog entry. `readHead` already clamps to the real
-      // stat size, so MAX_MESSAGE_BYTES bounds memory on its own.
-      const limit = MAX_MESSAGE_BYTES;
-      /** @type {ParsedRows} */
-      let parsedFile;
-      try {
-        parsedFile = await loadParsedRows(parsedRows, filePath, limit);
-      } catch (error) {
-        context.logger.error('miniapp.trajectory.read_error', { reason: 'messages_unreadable', code: errorCode(error) });
-        sendError(response, 500, 'trajectory_unreadable', '会话数据暂时无法读取');
-        return;
-      }
-      // Kept as a flag on the cached value rather than a log line at the read site: a file that
-      // parsed empty once will parse empty every time, and a hit must still say so.
-      if (parsedFile.empty) {
-        context.logger.warn('miniapp.trajectory.read_error', { reason: 'empty_messages' });
-      }
-      if (parsedFile.truncated) truncated = true;
-      readBytes += parsedFile.read;
-      skippedTotal += parsedFile.skipped;
-      const keep = filter === null || filter === link.generation;
-      // The rows are shared with the cache and with every other request that read this file.
-      // Stamping the generation is the only write to them, and one filePath always maps to one
-      // generation, so it is idempotent. Pinned by tests/verify-parsed-rows.mjs.
-      for (const row of parsedFile.rows) {
-        if (keep) {
-          row[ROW_GENERATION] = link.generation;
-          rows.push(row);
-        }
-      }
+    // One logical message per id, every stored copy of it folded in, and the versions it was
+    // written in kept rather than dropped. `filter === null` shows every message once at its
+    // first version; a generation number shows that generation's own stored context.
+    const identityTable = buildMessageIdentity(occurrences);
+    const view = selectIdentityView(identityTable, filter);
+    const rows = view.rows;
+    const rowLocators = view.occurrences.map((occurrence) => occurrence.locator);
+    if (identityTable.conflicts.length > 0) {
+      context.logger.warn('miniapp.trajectory.parse_warn', { identity_conflicts: identityTable.conflicts.length });
     }
-    if (skippedTotal > 0) {
-      context.logger.warn('miniapp.trajectory.parse_warn', { skipped: skippedTotal });
+    if (identityTable.stats.unclassified > 0) {
+      context.logger.warn('miniapp.trajectory.parse_warn', { identity_unclassified: identityTable.stats.unclassified });
     }
 
     const shown = filter === null ? lineage.chain : lineage.chain.filter((link) => link.generation === filter);
@@ -2285,6 +3502,8 @@ export async function start(context) {
       generations,
       generation: shown.length === 1 ? shown[0].generation : null,
       orphans: lineage.orphans,
+      identity: identityTable,
+      openerByTurn: view.openerByTurn,
     });
     payload.session.lastActiveAt = entry.lastActiveAt;
     payload.session.activeGeneration = activeArtifact === null ? null : activeArtifact.generation;
@@ -2307,11 +3526,27 @@ export async function start(context) {
 
     // Last thing before serializing, and the only place `raw` is ever touched: from here on
     // the body carries no message bodies at all.
-    // The locator map plus the rows it points into. Both are references: the rows are the
-    // same objects the parsed-rows cache holds, so this adds a map of numbers and an array of
-    // pointers rather than a second copy of the session. Keeping the array here also means
-    // /raw still answers after the parsed-rows cache has evicted the file.
-    const raws = splitRawRecords(payload.turns);
+    // The record -> locator map. Locators, not row references: the parsed rows behind them are
+    // about to stop existing, and this entry is what has to outlive them for `/raw` to still work.
+    // `rowPos` says which of that row's records this index is, which is what lets
+    // `/api/trajectory/record` project one line and answer for one record out of it.
+    /** @type {Map<number, number>} */
+    const rowPosByRecord = new Map();
+    const rowIndexByRecord = splitRawRecords(payload.turns, rowPosByRecord);
+    /** @type {Map<number, LineLocator>} */
+    const raws = new Map();
+    for (const [recordIndex, rowIndex] of rowIndexByRecord) {
+      const locator = rowLocators[rowIndex];
+      if (locator !== undefined) raws.set(recordIndex, locator);
+    }
+
+    // Last thing before serializing, and the only place the bulk fields are ever taken off a
+    // record. It happens here rather than at `push()` because the search, which runs in this
+    // process and never serialises, still reads those fields off the projected records — so
+    // removing them at the projection would have broken search to save the page memory. The delta
+    // below is built from the same payload, so it is slim too: a poll carries no more bulk than
+    // the first load did.
+    slimPayloadForWire(payload);
 
     let body;
     try {
@@ -2320,12 +3555,17 @@ export async function start(context) {
       sendJson(response, 500, { error: 'trajectory_unserializable', message: '会话数据暂时无法读取' });
       return;
     }
-    trajectoryCache.set(cacheKey, { at: Date.now(), etag, body, raws, rows });
-    while (trajectoryCache.size > TRAJECTORY_CACHE_ENTRIES) {
-      const oldest = trajectoryCache.keys().next();
-      if (oldest.done) break;
-      trajectoryCache.delete(oldest.value);
-    }
+    // The family is the session plus the requested slice: the parts of the answer that stay the
+    // same while it goes stale. Everything that decides whether the answer changed stays in the
+    // key, so a newer version of one family replaces its predecessor instead of stacking beside it.
+    // `decoded` is filled in by /raw, at most RAW_DECODE_CACHE_ENTRIES lines' worth.
+    trajectoryCache.set(cacheKey, trajectoryCacheFamily(entry.dir, filter), { at: Date.now(), etag, body, raws, rowPos: rowPosByRecord, decoded: new Map() });
+    // Nothing below reads `rows` or `rowLocators`, and `payload` holds its own projections rather
+    // than the rows, so this is where the object graph stops being reachable. A sealed generation's
+    // rows are still held by the parsed-rows cache — that is the point of that cache — but the
+    // active file's are now only held by this array.
+    rows.length = 0;
+    rowLocators.length = 0;
     // `?since=` asks for the tail. The whole body is serialized either way — the cache
     // entry and /raw both need it — so this saves the transfer and the page's JSON.parse,
     // and not the server's work. Any reading of "41 MB → a few KB, so polling got faster"
@@ -2335,14 +3575,378 @@ export async function start(context) {
     sendJsonBody(response, 200, delta === null ? body : JSON.stringify(delta), { etag, revalidate: true });
   };
 
+/**
+ * One needle against one session, answered from the same projection the payload is built from.
+   *
+   * WHY IT IS A READ AND NOT A SCAN OF WHAT THE PAGE ALREADY HAS. The page searches five fields per
+   * record, and those five fields are the bulk of the payload — so a search the page can do itself
+   * requires the page to hold the bulk, which is the thing being removed. A search that is answered
+   * here does not have to be shipped to it.
+   *
+   * WHY IT REBUILDS FOR NOW. This walks the lineage and projects it exactly as `/api/trajectory`
+   * does, so the records it searches are the records that payload would carry — which is what makes
+   * a hit a row the reader can actually be sent to. Segments are written as a side effect here, so a
+   * later pass can answer a search without the rebuild; until then this is the correct answer and
+   * the measured cost of one.
+   *
+   * The two rules that are not negotiable, because both were true of the version it replaces:
+   *
+   *  - **A hit is a DISPLAYED record.** The scan runs over the projected view, not over the stored
+   *    rows, so a version the identity layer suppressed — a copy of a message already shown, or the
+   *    trimmed half of a rewrite — cannot be reported as a row in the ledger.
+   *  - **A needle never crosses a record.** Each record is tested on its own, which is what
+   *    `scanSegment` is for and what a joined blob would quietly stop doing.
+   */
+  const handleSearch = async (response, url) => {
+    const ctx = await resolveTrajectoryRequest(url);
+    if (!ctx.ok) {
+      sendError(response, ctx.status, ctx.code, ctx.message);
+      return;
+    }
+    const asked = url.searchParams.get('q') ?? '';
+    // A needle too short to be a question matches almost every record; answering with the whole
+    // ledger is not an answer, and returning it would cost more than the reader wanted to know.
+    if (!needleIsUsable(asked)) {
+      sendError(response, 400, 'search_query_required', '请输入至少两个字符');
+      return;
+    }
+    const needle = foldNeedle(asked);
+    const { entry, filter } = ctx;
+
+    let walked;
+    try {
+      walked = await collectLineage(entry, ctx.generations);
+    } catch (error) {
+      sendError(response, 500, 'trajectory_unreadable', lineageFailure(error));
+      return;
+    }
+    const { occurrences, files } = walked;
+    const sessionKey = searchSessionKey(entry.dir, ctx.identity.id);
+    const viewKey = searchViewKey(filter);
+
+    // Before anything expensive. The lineage walk above is stat-driven and cheap; everything after
+    // this line is the rebuild, and on the largest session measured here it was 3.7 seconds for a
+    // search that returns at most 500 rows.
+    const onDisk = await searchFromArtifacts({ sessionKey, viewKey, files, needle });
+    if (onDisk !== null) {
+      sendJson(response, 200, {
+        query: asked,
+        hits: onDisk.hits,
+        total: onDisk.total,
+        truncated: onDisk.total > onDisk.hits.length,
+        // The same field the rebuild sends. Two paths answering the same request with two different
+        // response shapes is not a faster version of the endpoint, it is a second endpoint.
+        session: { id: ctx.identity.id, generation: filter },
+      });
+      return;
+    }
+
+    const identityTable = buildMessageIdentity(occurrences);
+    const view = selectIdentityView(identityTable, filter);
+    const payload = buildTrajectoryPayload({
+      session: { id: ctx.identity.id, createdAtMs: entry.lastActiveAt },
+      rows: view.rows,
+      sizeBytes: walked.readBytes,
+      truncated: walked.truncated,
+      redact,
+      generations: ctx.generations,
+      generation: null,
+      orphans: walked.lineage.orphans,
+      identity: identityTable,
+      openerByTurn: view.openerByTurn,
+    });
+    const rowLocators = view.occurrences.map((occurrence) => occurrence.locator);
+    const rowIndexByRecord = splitRawRecords(payload.turns);
+
+    /** @type {Array<{ index: number, turnIndex: number, kind: string, summary: string, generation: number | null }>} */
+    const hits = [];
+    let total = 0;
+    const searched = collectSearchHits(payload, needle, MAX_SEARCH_HITS);
+    hits.push(...searched.hits);
+    total = searched.total;
+
+    // Written as a side effect, never awaited into the answer: an artifact that cannot be written is
+    // a slower next search, not a failed one, and a failure here must not turn a hit into an error.
+    void publishSearchArtifacts({
+      entry,
+      sessionKey,
+      viewKey,
+      payload,
+      raws: rowIndexByRecord,
+      rowLocators,
+      files,
+      activeFileName: walked.activeFileName,
+    }).catch(() => undefined);
+
+    sendJson(response, 200, {
+      query: asked,
+      hits,
+      total,
+      truncated: total > hits.length,
+      session: { id: ctx.identity.id, generation: filter },
+    });
+    // Nothing below reads the view, and the payload holds projections rather than rows, so this is
+    // where the object graph stops being reachable.
+    view.rows.length = 0;
+    rowLocators.length = 0;
+  };
+
+  /**
+   * Answers a search from the stored segment of each generation, or `null` when they cannot.
+   *
+   * `null` is the answer for every "no" here — a segment missing, unreadable, or not readable
+   * back once the scan has named a line in it — and the caller rebuilds. It is deliberately not a
+   * partial answer: `total` is how many records in the whole session matched, so answering from 44
+   * of 45 generations would report a smaller total and the page would tell the reader the needle
+   * matched fewer things than it did, with nothing anywhere saying so.
+   *
+   * What makes the segments trustworthy without re-deriving anything: `sameSource` checks each
+   * generation's identity and whether its read was cut short, the manifest pins the schema and the
+   * bytes' digest, and the identity decisions baked into them are a pure function of exactly those.
+   * Same sources and same code, so the answers are the ones the rebuild would have produced —
+   * which is why no second intersection against the current view is done here. That extra
+   * intersection is the kind of step that silently disagrees with the thing it is checking.
+   *
+   * The session's record index is NOT read. Each segment line carries its own answer, so a needle
+   * matching 14 records out of 36,525 reads those 14 lines rather than parsing 34.2 MB of index.
+   *
+   * @param {{ sessionKey: string, viewKey: string, files: Array<any>, needle: string }} input
+   */
+  const searchFromArtifacts = async ({ sessionKey, viewKey, files, needle }) => {
+    /** @type {Array<{ index: number, turnIndex: number | null, kind: string, summary: string, generation: number | null }>} */
+    const hits = [];
+    let total = 0;
+    // `files` is the lineage walk's own output, so a generation that is no longer in the lineage
+    // has no entry here and no segment is read — a leftover on disk cannot keep it searchable.
+    for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
+      const file = files[fileIdx];
+      const segment = await segmentStore.read(sessionKey, viewKey, generationKey(file.generation), [file]);
+      if (segment === null) return null;
+      const ordinals = scanSegment(segment.surface, needle);
+      const answers = readSegmentHits(segment.surface, ordinals);
+      for (const hit of answers) {
+        // A line the scan named that cannot be read back is a segment written by something that
+        // does not agree with this reader. Answering without it would quietly drop a record.
+        if (hit === null) return null;
+        total += 1;
+        if (hits.length < MAX_SEARCH_HITS) hits.push(hit);
+      }
+    }
+    // Ascending ledger order, because the segments were read oldest generation first and a hit's
+    // place in that list is what the page scrolls to. Sorting by the index itself is the order the
+    // rebuild produces, and two answers that differ only in order are two answers.
+    hits.sort((a, b) => a.index - b.index);
+    return { hits, total };
+  };
+
+  /**
+   * The artifacts a search would like the NEXT search to be able to skip the rebuild for.
+   *
+   * Best effort by construction: every step is wrapped, and the whole thing is fire-and-forget from
+   * the caller. A session that never gets an index keeps answering correctly, just at the rebuild's
+   * cost — which is what it did before any of this existed.
+   *
+   * @param {{ entry: any, sessionKey: string, viewKey: string, payload: any, raws: Map<number, number>, rowLocators: Array<any>, files: Array<any>, activeFileName: string }} input
+   */
+  const publishSearchArtifacts = async (input) => {
+    const { entry, sessionKey, viewKey, payload, raws, rowLocators, files, activeFileName } = input;
+    /** @type {Map<number, any>} */
+    const locators = new Map();
+    for (const [recordIndex, rowIndex] of raws) {
+      const locator = rowLocators[rowIndex];
+      if (locator !== undefined) locators.set(recordIndex, locator);
+    }
+    const fileIdxRows = fileIdxRowsFromPayload(payload, locators, files);
+
+    // One segment per generation, the active one included. §8.8.1 rule 5 excluded the active
+    // generation on the grounds that a segment for it would be stale before it was written — true,
+    // and it is still true. What changed is that nothing has to TRUST it: `sameSource` reads the
+    // generation's own size, so an appended file invalidates its own segment and only its own, and
+    // an artifact that cannot be trusted makes the search fall back rather than answer. Without a
+    // segment for the active generation there would be nothing to scan at all on a session that is
+    // still being written, which is the one case a reader is most likely to search.
+    //
+    // The surface comes from the PAYLOAD's records, not from a narrower copy of them. That copy
+    // dropped the four bulk fields to stay small, and three of the five fields — `text`, `result`,
+    // `thinking` — are searchable. A segment built from it therefore searched two of the five, which
+    // narrows what a reader can find with nothing anywhere reporting it. Measured on the largest
+    // session here: the needle "needle" reported 14 matches through the artifacts and 45 through
+    // the rebuild, and the two answers were both plausible.
+    //
+    // What the payload cannot say on its own is which source file a record came from, so that is
+    // what gets projected out of the lineage's row locators: the payload's fields for the surface,
+    // and a file number to group by below. The locator's byte range is not projected — nothing on
+    // the segment line reads it back, so carrying it cost 4.36% of every segment for nothing.
+    // See the note on fileIdxRowsFromPayload.
+    const flatRecords = [];
+    for (const turn of payload.turns) {
+      for (const record of turn.records) flatRecords.push({ record, turn });
+    }
+    for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
+      const records = [];
+      for (let i = 0; i < flatRecords.length; i += 1) {
+        const located = fileIdxRows[i];
+        if (located === undefined || located.fileIdx !== fileIdx) continue;
+        records.push({
+          ...flatRecords[i].record,
+          // The turn this record sits in travels with it: the answer names a turn, and reading it
+          // back out of the session's turn table would mean reading that table on every search.
+          turnIndex: flatRecords[i].turn.index,
+          fileIdx: located.fileIdx,
+        });
+      }
+      // A generation with no records still gets a segment, and it is an empty one. Skipping it
+      // would leave the reader with nothing to find, and "nothing to find" is exactly what a
+      // missing segment reports — so a session holding one empty generation would fall back to the
+      // rebuild forever, for a generation that could never match anything.
+      const generation = files[fileIdx].generation;
+      const generationKeyValue = generationKey(generation);
+      // Already there and still matching its source: nothing to do, which is the common case on a
+      // session that is not being compacted right now.
+      const existing = await segmentStore.read(sessionKey, viewKey, generationKeyValue, [files[fileIdx]]);
+      if (existing !== null) continue;
+      const segment = buildSegment({ records });
+      await segmentStore.write(sessionKey, viewKey, generationKeyValue, segment, {
+        generation,
+        source: [files[fileIdx]],
+      });
+    }
+    void entry;
+  };
+
   /**
    * One record's untouched message, fetched only when something actually reads it.
    *
-   * Served out of the same cache entry as the bulk body, so opening the inspector's raw
-   * tab costs one record rather than a session. A miss means this process restarted
-   * between the two calls; saying so is more honest than silently showing the normalized
-   * record in a panel labelled 原文.
+   * The body no longer has the parsed rows behind it, so the line is read back out of the file it
+   * came from. That is a seek and a digest over one line, against the alternative of holding every
+   * session's object graph in memory for the life of the page — measured at 233 MB of the 378 MB
+   * this process held while one session was open.
+   *
+   * The digest is what makes that safe to do. Between building the body and answering this request
+   * the file can be rewritten; the trajectory entry is keyed on the file's size and mtime, so a
+   * rewrite that preserved both would otherwise be served the wrong message under the right
+   * record's name. Answering `raw_stale` says the session moved instead.
+   *
+   * A missing entry means this process restarted between the two calls; saying so is more honest
+   * than silently showing the normalized record in a panel labelled 原文.
    */
+  /**
+   * One record's four bulk fields, read on request.
+   *
+   * The page used to receive all four on every row of every poll — measured over this machine's
+   * whole store, 59.1% of the body: `result` 26.6%, `thinking` 13.2%, `arguments` 9.3%, `text`
+   * 8.9% — and used them to draw a ledger row and, when the reader opened one record, four tabs.
+   * It now receives four presence flags and asks for the values when it is going to show them.
+   *
+   * It re-projects the ONE stored line that record came from, rather than rebuilding the session.
+   * A line can expand into several records (its text, each thinking block, each tool call), so the
+   * answer has to name which of them — `rowPos`, stamped at `push()` — and rebuilding the whole
+   * session to return one field would cost exactly what this change exists to stop paying.
+   *
+   * The bytes come through the same locator `/raw` uses and carry the same digest check, so a file
+   * that moved under the cache answers 「该记录所在的文件已变化」 here too, instead of projecting a
+   * line that is no longer the one the page is looking at.
+   */
+  const handleRecord = async (response, url) => {
+    const ctx = await resolveTrajectoryRequest(url);
+    if (!ctx.ok) {
+      sendError(response, ctx.status, ctx.code, ctx.message);
+      return;
+    }
+    const wanted = Number.parseInt(url.searchParams.get('index') ?? '', 10);
+    if (!Number.isInteger(wanted) || wanted < 1) {
+      sendError(response, 400, 'record_index_required', '缺少记录序号');
+      return;
+    }
+    const cached = trajectoryCache.get(ctx.cacheKey);
+    if (!cached) {
+      sendError(response, 503, 'trajectory_not_cached', '会话数据已释放，请重新加载');
+      return;
+    }
+    const locator = cached.raws.get(wanted);
+    const rowPos = cached.rowPos.get(wanted);
+    if (locator === undefined || typeof locator.filePath !== 'string' || typeof rowPos !== 'number') {
+      sendError(response, 404, 'record_not_found', '找不到该记录');
+      return;
+    }
+    const found = await readRecordRow(locator);
+    if ('error' in found) {
+      context.logger.warn('miniapp.trajectory.read_error', { reason: `record_${found.reason}` });
+      sendError(response, found.status, found.error, found.error === 'raw_stale'
+        ? '该记录所在的文件已变化，请重新加载会话'
+        : '找不到该记录');
+      return;
+    }
+    // One row in, one row's records out. `sizeBytes` is this line's own length: the only thing the
+    // projection does with it is report truncation, and a one-line view is never truncated.
+    const one = buildTrajectoryPayload({
+      session: { id: ctx.identity.id, createdAtMs: ctx.entry.lastActiveAt },
+      rows: [found.row],
+      sizeBytes: found.sizeBytes,
+      truncated: false,
+      redact,
+      generation: null,
+    });
+    const record = one.turns.flatMap((turn) => turn.records ?? [])[rowPos];
+    if (record === undefined) {
+      // The line projected into fewer records than the payload had for it. That means the two
+      // projections disagree about what this line contains, and answering with the wrong one would
+      // show the reader another record's content — so it is a 404, not a best effort.
+      context.logger.warn('miniapp.trajectory.read_error', { reason: 'record_position_gone', rowPos });
+      sendError(response, 404, 'record_not_found', '找不到该记录');
+      return;
+    }
+    sendJson(response, 200, {
+      index: wanted,
+      // No `kind`. Measured over 6568 records of this machine's store: re-projecting one row
+      // returns the same four values every time, but it disagrees about `kind` for an opener —
+      // a `steer` row projected alone has no earlier turn to have been interrupted by, so it
+      // comes back a `user`. The page already has the record and its kind; handing back a second
+      // one that is known to differ on openers is a second answer to a question it already
+      // answered, and the kind is the one field a reader would act on.
+      text: typeof record.text === 'string' ? record.text : null,
+      thinking: typeof record.thinking === 'string' ? record.thinking : null,
+      arguments: record.arguments ?? null,
+      result: typeof record.result === 'string' ? record.result : null,
+      textTruncated: record.textTruncated === true,
+    });
+  };
+
+  /**
+   * The stored line a record was projected from, or the reason there isn't one.
+   *
+   * ONE place, because there are two readers of it: `/api/trajectory/raw` wants the untouched
+   * message and `/api/trajectory/record` wants the projected fields. The check that the bytes are
+   * still the bytes that record was built from belongs to neither of them. Written twice it is two
+   * answers to "is this still the right line", and the copy nobody thinks about is the one that
+   * eventually stops answering — which is also how the guard stopped being able to tell the two
+   * apart.
+   *
+   * The digest is the whole point. A file that rotated under the cache has the same path and
+   * different bytes, and without this a record index would quietly resolve to whichever line now
+   * sits at that offset.
+   *
+   * @param {{ filePath: string, start: number, end: number, digest: string }} locator
+   * @returns {Promise<{ row: any, sizeBytes: number } | { error: string, status: number, reason: string }>}
+   */
+  const readRecordRow = async (locator) => {
+    const bytes = await readRange(locator.filePath, locator.start, locator.end);
+    if (bytes === null || lineDigest(bytes) !== locator.digest) {
+      return { error: 'raw_stale', status: 409, reason: 'stale' };
+    }
+    /** @type {any} */
+    let row;
+    try {
+      row = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      return { error: 'raw_stale', status: 409, reason: 'unparseable' };
+    }
+    if (!row || typeof row !== 'object') {
+      return { error: 'record_not_found', status: 404, reason: 'not_object' };
+    }
+    return { row, sizeBytes: bytes.length };
+  };
+
   const handleRaw = async (response, url) => {
     const ctx = await resolveTrajectoryRequest(url);
     if (!ctx.ok) {
@@ -2359,16 +3963,36 @@ export async function start(context) {
       sendError(response, 503, 'trajectory_not_cached', '会话数据已释放，请重新加载');
       return;
     }
-    const rowIndex = cached.raws.get(wanted);
-    const row = rowIndex === undefined ? undefined : cached.rows[rowIndex];
-    if (rowIndex === undefined || !row || typeof row !== 'object') {
+    // Re-reading a record the reader has already opened is the common case, and a decoded message
+    // is far smaller than a session, so the entry keeps the ones it has already paid for.
+    const alreadyDecoded = cached.decoded.get(wanted);
+    if (alreadyDecoded !== undefined) {
+      sendJson(response, 200, { index: wanted, raw: alreadyDecoded.value, omitted: alreadyDecoded.omitted });
+      return;
+    }
+    const locator = cached.raws.get(wanted);
+    if (locator === undefined || typeof locator.filePath !== 'string') {
       sendError(response, 404, 'record_not_found', '找不到该记录');
+      return;
+    }
+    const found = await readRecordRow(locator);
+    if ('error' in found) {
+      context.logger.warn('miniapp.trajectory.read_error', { reason: `raw_${found.reason}` });
+      sendError(response, found.status, found.error, found.error === 'raw_stale'
+        ? '该记录所在的文件已变化，请重新加载会话'
+        : '找不到该记录');
       return;
     }
     // The one place the untouched message is materialised, for one record, on request. The
     // size verdict travels with it because the page has to be able to say "omitted" rather
     // than silently show something else — see tests/verify-raw-lazy.mjs.
-    const built = buildRawPayload(row.message, redact);
+    const built = buildRawPayload(found.row.message, redact);
+    cached.decoded.set(wanted, built);
+    while (cached.decoded.size > RAW_DECODE_CACHE_ENTRIES) {
+      const oldest = cached.decoded.keys().next();
+      if (oldest.done) break;
+      cached.decoded.delete(oldest.value);
+    }
     sendJson(response, 200, { index: wanted, raw: built.value, omitted: built.omitted });
   };
 
@@ -2432,6 +4056,20 @@ export async function start(context) {
       });
       return;
     }
+    if (url.pathname === '/api/trajectory/search') {
+      void handleSearch(response, url).catch((error) => {
+        context.logger.error('miniapp.trajectory.read_error', { reason: 'search_failed', code: errorCode(error) });
+        sendError(response, 500, 'trajectory_unreadable', '搜索暂时不可用');
+      });
+      return;
+    }
+    if (url.pathname === '/api/trajectory/record') {
+      void handleRecord(response, url).catch((error) => {
+        context.logger.error('miniapp.trajectory.read_error', { reason: 'record_failed', code: errorCode(error) });
+        sendError(response, 500, 'trajectory_unreadable', '记录详情暂时无法读取');
+      });
+      return;
+    }
     if (url.pathname === '/api/trajectory/raw') {
       void handleRaw(response, url).catch((error) => {
         context.logger.error('miniapp.trajectory.read_error', { reason: 'raw_failed', code: errorCode(error) });
@@ -2462,14 +4100,14 @@ export async function start(context) {
   const dispose = () => {
     if (disposal) return disposal;
     context.signal.removeEventListener('abort', onAbort);
-    listCache = { at: 0, entries: null };
+    listCache = { at: 0, candidates: null };
     titleCache = { at: 0, key: '', map: new Map() };
+    sessionsBody = { material: '', body: null };
     descriptorCache.clear();
     trajectoryCache.clear();
-    // The parsed-row cache is the largest of the three and was the only one not released here, so a
-    // disposed runtime kept a whole session's parsed rows alive — measured at roughly 43MB of heap
-    // still held for a 39MB session after dispose. It has the same clear() as the others and was
-    // simply missed; the line is here so the next cache added cannot repeat the omission quietly.
+    // The parsed-row cache only ever holds sealed generations now, but it is still a cache that
+    // has to be released here: a disposed runtime that kept it would still hold a rotated
+    // generation's rows. The line is here so the next cache added cannot repeat the omission.
     parsedRows.clear();
     clientEntry = null;
     disposal = close(server).then(() => undefined);
@@ -2495,6 +4133,10 @@ function stripInternalFields(value) {
     sizeBytes: value.sizeBytes,
     turnCount: value.turnCount,
     sessionKind: value.sessionKind ?? null,
+    // Null is the normal case and has to survive as null rather than as `undefined`: the page
+    // decides by whether this field is set, so a missing key and a present key both reading
+    // "not set" is what keeps one row from being a branch and the next from merely lacking it.
+    sessionParentId: value.sessionParentId ?? null,
   };
 }
 

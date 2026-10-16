@@ -36,7 +36,7 @@
  * catch it by name, so nothing here can be an assertion nothing could fail.
  */
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('../miniapp/node/server.mjs', import.meta.url));
 const HTML = fileURLToPath(new URL('../miniapp/client/index.html', import.meta.url));
@@ -52,15 +52,33 @@ function assert(name, cond) {
 
 /* ---------- 1: the TTL outlives the poll that expires it ---------- */
 
+// The governing cadence is the LIST's, not the page's. One `POLL_INTERVAL` drove both fetches when
+// this was written, so the two were the same number by coincidence; the page now has a tick per
+// fetch, and asserting against the trajectory's would let the list be polled twice as often as
+// its cache can answer.
 const ttl = /const LIST_CACHE_TTL_MS\s*=\s*(\d+)/.exec(server);
-const poll = /var POLL_INTERVAL\s*=\s*(\d+)/.exec(html);
+const sessionPoll = /var SESSION_POLL_INTERVAL\s*=\s*(\d+)/.exec(html);
 
 assert('the list TTL is still declared in the server', ttl !== null);
-assert('the poll interval is still declared in the client', poll !== null);
+assert('the list\'s poll interval is still declared in the client', sessionPoll !== null);
 
-if (ttl && poll) {
-  assert('LIST_CACHE_TTL_MS (' + ttl[1] + ') is at or above POLL_INTERVAL (' + poll[1] + ') — a cache below the poll interval can never be hit',
-    Number(ttl[1]) >= Number(poll[1]));
+if (ttl && sessionPoll) {
+  assert('LIST_CACHE_TTL_MS (' + ttl[1] + ') is at or above the list poll interval (' + sessionPoll[1] + ') — a cache below the poll interval can never be hit',
+    Number(ttl[1]) >= Number(sessionPoll[1]));
+}
+
+// The other direction, and it is what makes a 304 on this route honest. A revalidated list means
+// "the payload I would send you now is the one you have", so its staleness bound cannot be looser
+// than the descriptor cache whose entries it is derived from. The tag is computed from the walk's
+// output, so it is as old as LIST_CACHE_TTL_MS; the descriptors behind it are as old as
+// SESSION_CACHE_TTL_MS. If that ever inverts, the validator is the freshest input in the route
+// and a stale descriptor can be pinned in place by a tag that says nothing changed.
+const descriptorTtl = /const SESSION_CACHE_TTL_MS\s*=\s*(\d+)/.exec(server);
+assert('the descriptor cache budget is still declared', descriptorTtl !== null);
+if (ttl && descriptorTtl) {
+  assert('LIST_CACHE_TTL_MS (' + ttl[1] + ') is at or below SESSION_CACHE_TTL_MS (' + descriptorTtl[1]
+    + ') — the walk must not be able to feed a validator built on fresher facts than the descriptors it stands for',
+    Number(ttl[1]) <= Number(descriptorTtl[1]));
 }
 
 /* ---------- 2 & 3: one poll, one walk, one database open ---------- */
@@ -79,6 +97,11 @@ assert('the list route reaches titles through the cache',
 
 assert('dispose releases the title cache',
   /titleCache = \{ at: 0, key: '', map: new Map\(\) \};[\s\S]{0,240}?descriptorCache\.clear\(\)/.test(server));
+
+// The list body cache is a third thing the poll built, and it holds serialized bytes this time.
+// It is small next to the two above, which is exactly why it is the one that gets forgotten.
+assert('dispose releases the list body cache',
+  /sessionsBody = \{ material: '', body: null \};[\s\S]{0,240}?descriptorCache\.clear\(\)/.test(server));
 
 /* ---------- 5: the peek that backs the list is bounded ---------- */
 
@@ -134,6 +157,107 @@ const clientJs = html
 assert('the session picker omits the count segment instead of printing a placeholder',
   /var tail = isCount\(count\) \?/.test(clientJs)
   && /'（' \+ when \+ '）'/.test(clientJs));
+
+/* ---------- 7: the branch a session was spawned from is carried, not dropped ---------- */
+// The store has always had a `parent_session_id`, and the list route has always read the titles
+// beside it without reading it — so every sub-agent run the runtime spawned was listed exactly
+// like a top-level conversation. Nothing caught that, because nothing was pinned about WHICH
+// fields the list is allowed to drop: `stripInternalFields` had no reader anywhere in this
+// directory, so a field could be added, or lost, and the suite stayed green either way.
+//
+// Four links, and dropping any one of them produces the same silent list: the column is not
+// selected, or it is selected and not mapped, or it is mapped and not put on the descriptor, or
+// it reaches the descriptor and is stripped before it is sent. Each gets its own assertion
+// because each is a place the value can be lost without a type error or a crash.
+assert('the titles query reads the parent column',
+  /select session_id, title, session_kind, parent_session_id from local_runtime_sessions where session_id = \?/.test(server));
+
+assert('the parent row is mapped, and an empty id is no parent rather than a parent named ""',
+  /parent:\s*typeof row\.parent_session_id === 'string' && row\.parent_session_id !== ''\s*\n\s*\?\s*row\.parent_session_id\s*\n\s*:\s*null,/.test(server));
+
+assert('the descriptor carries the parent onto the row the page receives',
+  /descriptor\.sessionParentId = meta\.parent;/.test(server));
+
+// `?? null` rather than a bare copy: the page decides by whether this field is SET, so a missing
+// key and a present-but-undefined one have to land in the same place as a row that has no parent.
+assert('the field survives the strip, with null as the floor',
+  /sessionParentId:\s*value\.sessionParentId \?\? null,/.test(server));
+
+// The reader-facing half, off the comment-stripped client for the reason given in section 6: the
+// comment above `sessionOptionLabel` names the marker, so an assertion made against the raw file
+// would be satisfied by prose describing the very thing it exists to require.
+assert('the page decides the marker by the field and not unconditionally',
+  /var branch = session && session\.sessionParentId \? BRANCH_MARK : '';/.test(clientJs));
+
+/* ---------- 6. a database without the column, which the four regexes above cannot see ----------
+ *
+ * Everything above reads `server.mjs` as text, and every one of those regexes is satisfied by a
+ * query that works. None of them is satisfied by a query that FAILS, which is the whole case here:
+ * `db.prepare` throws on a column the database does not have, and the throw landed in the empty
+ * catch that exists for a different reason ("a title is a nicety"). So on a runtime database
+ * written before child sessions existed, the page showed no titles and no kinds at all — every
+ * session fell back to the first sentence of its transcript — and nothing in the suite could see
+ * it, because the shape of a correct query is the shape of a query nobody ran.
+ *
+ * So this runs the function against a real database built here, with and without the column. The
+ * without-case is the one that carries the rule: the titles and the kind are the page's whole
+ * reason for opening the database, and a missing optional column is not a reason to lose them. */
+const { mkdtempSync, mkdirSync, rmSync } = await import('node:fs');
+const { tmpdir } = await import('node:os');
+const { join } = await import('node:path');
+// `node:sqlite` is still flagged experimental, and the flag goes to stderr the moment the module
+// is first loaded. The runner reads `stdout + stderr` and prints the LAST non-empty line, so the
+// warning lands where this guard's own result line should be and `verify-list-cache.mjs` gets
+// reported with the text of an unrelated warning instead of its verdict. Narrowly filtered, and
+// installed BEFORE the import that provokes it: anything else still prints.
+const emitWarning = process.emitWarning;
+process.emitWarning = (warning, ...rest) => (
+  String(warning).startsWith('SQLite is an experimental feature')
+    ? undefined
+    : emitWarning.call(process, warning, ...rest));
+
+const { DatabaseSync } = await import('node:sqlite');
+// `SERVER` is a plain filesystem path, and a dynamic import of one on Windows is read as a URL
+// with an unsupported scheme. The module has to be asked for by its file: URL.
+const { readSessionTitles } = await import(pathToFileURL(SERVER).href);
+
+const runtimeDb = (columns) => {
+  const home = mkdtempSync(join(tmpdir(), 'mmc-trajectory-runtimedb-'));
+  mkdirSync(join(home, 'v2', 'sqlite'), { recursive: true });
+  const db = new DatabaseSync(join(home, 'v2', 'sqlite', 'runtime-state.sqlite'));
+  const extra = columns ? ', parent_session_id' : '';
+  const placeholders = columns ? '?, ?, ?, ?' : '?, ?, ?';
+  db.exec('create table local_runtime_sessions (session_id text primary key, title text,'
+    + ' session_kind text' + extra + ')');
+  const values = ['mvs_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '一条真实的标题', 'conversation'];
+  if (columns) values.push('mvs_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  db.prepare('insert into local_runtime_sessions (session_id, title, session_kind'
+    + extra + ') values (' + placeholders + ')').run(...values);
+  db.close();
+  return home;
+};
+
+const ids = ['mvs_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'];
+const homes = [];
+let withColumn = null;
+let withoutColumn = null;
+try {
+  homes.push(runtimeDb(true), runtimeDb(false));
+  withColumn = await readSessionTitles(homes[0], ids);
+  withoutColumn = await readSessionTitles(homes[1], ids);
+} finally {
+  // The homes are `mkdtemp` directories this call created, so they are cleaned up in the same
+  // breath rather than left behind for the OS to find.
+  for (const h of homes) rmSync(h, { recursive: true, force: true });
+}
+assert('a database with the parent column still reports the title, the kind and the parent',
+  withColumn.get(ids[0])?.title === '一条真实的标题'
+  && withColumn.get(ids[0])?.kind === 'conversation'
+  && withColumn.get(ids[0])?.parent === 'mvs_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+assert('a database WITHOUT the column keeps the title and the kind, and only loses the parent',
+  withoutColumn.get(ids[0])?.title === '一条真实的标题'
+  && withoutColumn.get(ids[0])?.kind === 'conversation'
+  && withoutColumn.get(ids[0])?.parent === null);
 
 console.log('[list-cache] ' + pass + ' passed, ' + failures.length + ' failed');
 if (failures.length) {

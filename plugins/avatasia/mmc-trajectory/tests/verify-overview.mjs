@@ -24,6 +24,50 @@ const body = bootIndex === -1 ? script : script.slice(0, bootIndex);
 const store = new Map();
 const noop = () => {};
 
+/** The smallest node that `el()`, `clear()` and the overview renderer can run against. */
+function domNode(tag) {
+  const kids = [];
+  const attrs = {};
+  return {
+    tag,
+    childNodes: kids,
+    // 0 = "never laid out", which is what the page's own fallback keys off. Tests that care
+    // about the width set it; everything else inherits the un-measured path.
+    layoutWidth: 0,
+    getBoundingClientRect() {
+      return { left: 0, right: this.layoutWidth, width: this.layoutWidth, top: 0, bottom: 8, height: 8 };
+    },
+    querySelectorAll(sel) {
+      const attr = String(sel).replace(/^\[/, '').replace(/\]$/, '');
+      return kids.filter((k) => k.getAttribute && k.getAttribute(attr) !== null);
+    },
+    querySelector(sel) {
+      const all = this.querySelectorAll(sel);
+      return all.length ? all[0] : null;
+    },
+    get firstChild() { return kids.length ? kids[0] : null; },
+    appendChild(n) { kids.push(n); return n; },
+    removeChild(n) { const i = kids.indexOf(n); if (i >= 0) kids.splice(i, 1); return n; },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; },
+    removeAttribute(k) { delete attrs[k]; },
+    style: {
+      props: Object.create(null),
+      setProperty(k, v) { this.props[k] = v; },
+      // The page reads the lane back off the node under the pointer, so the stub has to answer
+      // the read as well as the write. A stub that only records writes would make `overviewLaneAt`
+      // return -1 and quietly turn every hover assertion into "nothing was hovered".
+      getPropertyValue(k) { return this.props[k] ?? ''; }
+    },
+    get classList() {
+      const self = this;
+      return { contains: (c) => String(self.className || '').split(/\s+/).includes(c) };
+    },
+    className: '',
+    textContent: ''
+  };
+}
+
 /** Boot the delivered script in a sandbox, optionally with storage pre-seeded. */
 function buildSandbox(seed) {
   const local = seed || new Map();
@@ -40,7 +84,11 @@ function buildSandbox(seed) {
       setInterval: () => 0,
       clearInterval: noop
     },
-    document: { documentElement: { dataset: {} }, body: { classList: { add: noop, remove: noop } } }
+    document: {
+      documentElement: { dataset: {} },
+      body: { classList: { add: noop, remove: noop } },
+      createElement: (tag) => domNode(tag)
+    }
   };
   vm.createContext(sandbox);
   vm.runInContext(body, sandbox);
@@ -154,6 +202,70 @@ check('lane: a checkpoint is model lane, not input', sandbox.overviewLane({ kind
 const UNDATED = [ent(rec('u1', 'user', null, null), 1), ent(rec('u2', 'user', 500, 0), 1)];
 check('a record with no timestamp is not given a position', sandbox.overviewModel(UNDATED).spans.map((s) => s.id), ['u2']);
 check('no timed records yields no timeline at all', sandbox.overviewModel([ent(rec('u1', 'user', null, null), 1)]), null);
+
+/* --------------------------------------------------- the model is reused, not rebuilt */
+// Count the rebuilds rather than checking that the cache carries the two fields it needs. A cache
+// whose key is written but never read, or read but never compared, passes any assertion that only
+// looks for the shape — and a shell that stores the inputs and then rebuilds anyway would pass
+// one that only checks the values are equal, because a rebuilt model of the same rows IS the same
+// model. What has to be true is that the second call does no work.
+{
+  const realModel = sandbox.overviewModel;
+  let builds = 0;
+  sandbox.overviewModel = function (entries) { builds += 1; return realModel(entries); };
+
+  sandbox.state.actualDuration = false;
+  builds = 0;
+  const cold = sandbox.cachedOverviewModel(MIXED);
+  check('a cold cache builds the model', builds, 1);
+  const warm = sandbox.cachedOverviewModel(MIXED);
+  check('the same rows again do not rebuild it', builds, 1);
+  assert('and they hand back the very model that was built', cold === warm);
+
+  // A different array holding equal rows is still a rebuild. That is the price of the key: the
+  // payload path hands over a fresh array on every poll, so "deeply equal" would mean comparing
+  // every record to answer a question identity already answers.
+  builds = 0;
+  const equalRows = sandbox.cachedOverviewModel(MIXED.slice());
+  check('a different array of the same rows rebuilds', builds, 1);
+  check('and produces an equal model', JSON.stringify(equalRows), JSON.stringify(cold));
+
+  // Put MIXED back before the axis test. The step above leaves a *different* array in the cache,
+  // so a key that compared the rows but dropped the axis would still miss here and rebuild — and
+  // the rebuild the axis test observes would then prove nothing about the axis at all. That is
+  // not hypothetical: dropping `axis` from the key survived this file until this line was added.
+  sandbox.cachedOverviewModel(MIXED);
+
+  // The axis is the model's other input, read from state when it is built. Keying on the rows
+  // alone would keep a model from the other axis, and every record would be drawn at its
+  // position on the axis the reader just turned off.
+  builds = 0;
+  sandbox.state.actualDuration = true;
+  const onAxis = sandbox.cachedOverviewModel(MIXED);
+  check('turning the duration axis on rebuilds', builds, 1);
+  check('and the rebuilt model is on the compressed axis', onAxis.end - onAxis.start, 300);
+  check('with the idle gap removed, not shrunk', onAxis.spans[4].start, 1300);
+
+  builds = 0;
+  sandbox.cachedOverviewModel(MIXED);
+  check('the rebuilt axis is cached as well', builds, 0);
+
+  // An empty session produces no model at all, and reusing that answer must not depend on there
+  // being one: `overviewModel` returns null, and the caller branches on exactly that.
+  builds = 0;
+  const emptyRows = [ent(rec('z1', 'user', null, null), 1)];
+  check('a session with nothing dated yields no model', sandbox.cachedOverviewModel(emptyRows), null);
+  check('and building that answer counted once', builds, 1);
+  check('reusing it costs nothing', sandbox.cachedOverviewModel(emptyRows), null);
+  check('which is still no rebuild', builds, 1);
+
+  sandbox.overviewModel = realModel;
+  sandbox.state.actualDuration = false;
+  // Leave no cached model behind for the sections below, which build their own.
+  sandbox.overviewCache.flat = null;
+  sandbox.overviewCache.axis = null;
+  sandbox.overviewCache.model = null;
+}
 
 /* ------------------------------------------------------------- layer filters */
 /* 轮次 / 思考 / 调用 are presets over the same kind set the type chips edit — one filter,
@@ -569,19 +681,389 @@ sandbox.state.kinds = ['user'];
 check('strip: a record of a filtered-out kind is not drawn', sandbox.spanPassesFilter(fCall, false), false);
 check('strip: a record of a kept kind is drawn', sandbox.spanPassesFilter(fUser, false), true);
 /* Search is checked on its own, with every kind back on, so a pass can only come from
- * the text and a fail can only come from the text. */
+ * the hit set and a fail can only come from it.
+ *
+ * These three used to be about text. They are now about the server's answer, and the shape
+ * of the question changed with it: there is no needle to match against in the page any
+ * more, so "does this record contain the needle" is not a question the strip can answer at
+ * all. What it must do is follow the answer — and while there is no answer yet, draw
+ * everything, because a strip that empties itself before the search has come back is the
+ * exact symptom the count line's 正在搜索 exists to make legible.
+ *
+ * The records carry an `index` because that is what the answer names, and the set is built
+ * through the page's own `searchHitSet` rather than a literal `new Set`, so this goes
+ * through the same conversion the response goes through.
+ */
+const sHit = rec('s1', 'thinking', 3200, 0, { index: 41 });
+const sMiss = rec('s2', 'thinking', 3300, 0, { index: 42 });
 sandbox.state.kinds = ALL_KINDS;
 sandbox.state.query = 'needle-that-is-absent';
-check('strip: search rejects a record that does not contain the needle',
-  sandbox.spanPassesFilter(fThink, true), false);
-sandbox.state.query = 'bash';
-check('strip: search keeps a record that does',
-  sandbox.spanPassesFilter(fCall, true), true);
-check('strip: the same record is dropped when the needle is elsewhere',
-  sandbox.spanPassesFilter(fThink, true), false);
+sandbox.state.searchHits = null;
+check('strip: a search with no answer yet draws every record, not none',
+  [sandbox.spanPassesFilter(sHit), sandbox.spanPassesFilter(sMiss)], [true, true]);
+sandbox.state.searchHits = sandbox.searchHitSet([{ index: 41 }]);
+check('strip: the strip keeps the record the server hit',
+  sandbox.spanPassesFilter(sHit), true);
+check('strip: the strip drops the record the server did not hit',
+  sandbox.spanPassesFilter(sMiss), false);
+sandbox.state.searchHits = sandbox.searchHitSet([]);
+check('strip: an answered search that hit nothing draws nothing',
+  sandbox.spanPassesFilter(sHit), false);
+sandbox.state.searchHits = null;
 sandbox.state.query = '';
 check('strip: with nothing filtered every record is drawn',
   sandbox.spanPassesFilter(fCall, false), true);
+
+/* The turn handoff. `noReply` is the only rule that cannot be decided from a record alone —
+ * 无答复 is a property of the turn — so it is the only way to see whether the strip actually
+ * looks the owning turn up or just calls the list with nothing.
+ *
+ * Ticking a rule is a filter, not a highlight: it keeps what fires and drops the rest. So the
+ * three below are one contrast — same record shape, three turns — and the open/closed pair is
+ * the one that matters: only the turn lookup can tell those two apart.
+ *
+ * `turnById` is seeded here rather than by pushing a payload through, because the map is built
+ * on the poll path and this guard has no fetch to drive it with. That is a seam, not the
+ * thing under test: what is under test is that the strip consults the map at all.
+ */
+const openTurn = { id: 't-open', index: 1, closed: false };
+const shutTurn = { id: 't-shut', index: 2, closed: true };
+sandbox.turnById = new Map([[openTurn.id, openTurn], [shutTurn.id, shutTurn]]);
+sandbox.state.anomaly.rules = ['noReply'];
+check('strip: a record in an unclosed turn is drawn under 无答复, which only the turn lookup can decide',
+  sandbox.spanPassesFilter(rec('a1', 'user', 3400, 0, { turnId: openTurn.id })), true);
+check('strip: the same record in a closed turn is dropped under the same tick',
+  sandbox.spanPassesFilter(rec('a2', 'user', 3500, 0, { turnId: shutTurn.id })), false);
+check('strip: a record whose turn is unknown is dropped, because no turn rule fires on nothing',
+  sandbox.spanPassesFilter(rec('a3', 'user', 3600, 0, { turnId: 't-absent' })), false);
+sandbox.state.anomaly.rules = [];
+sandbox.turnById = new Map();
+
+/* ------------------------------------------------- the strip, drawn by the shipped code */
+/* Everything above asks `spanPassesFilter()` about one record. That is the predicate, not the
+ * strip. The defect this section exists for was a gate *in front of* the predicate inside
+ * `renderOverview()`, so a predicate-only guard could never see it: the predicate was always
+ * right, the caller had simply stopped asking. Hence the render runs here, and the invariant is
+ * the one a reader would state out loud — the strip is a picture of the list under it. Same
+ * records, same order, under every filter the page offers.
+ *
+ * A property, not a shape. The gate named two of five axes, and both cases below are one axis
+ * each — which is the whole reason the fix removed the gate instead of completing it: a list
+ * of axes is a list that drifts the next time an axis is added. Asserting "the strip equals
+ * the list" holds for an axis that does not exist yet; asserting "the gate mentions these two"
+ * would have passed while the strip was lying. */
+const STRIP_DOM_KEYS = ['overviewTrack', 'overviewTurns', 'overviewLanes', 'overviewSelection',
+  'overviewHover', 'overviewEmpty', 'overviewTip', 'overviewClear'];
+for (const key of STRIP_DOM_KEYS) sandbox.dom[key] = domNode('div');
+
+/* Five records carrying one difference each: a kind that can be unticked, a record the 异常
+ * axis can name, a timestamp a range can cut, and two records nothing touches. Both bounds are
+ * carried because the two readers disagree about which field they use: spans are placed by
+ * `timestamp`, the range filter reads `relativeMs`. A fixture with only one of them drops
+ * records for a reason that has nothing to do with the filter under test. */
+const STRIP = [
+  ent(rec('g1', 'user', 1000, 0, { relativeMs: 1000 }), 1),
+  ent(rec('g2', 'toolCall', 1100, 400, { relativeMs: 1100, responseId: 'R1', toolCallId: 'tc1', toolName: 'bash' }), 1),
+  ent(rec('g3', 'toolResult', 1100, 400, { relativeMs: 1100, toolCallId: 'tc1' }), 1),
+  ent(rec('g4', 'toolResult', 1600, 200, { relativeMs: 1600, toolCallId: 'tc2', isError: true }), 2),
+  ent(rec('g5', 'narration', 2000, 100, { relativeMs: 2000, responseId: 'R2' }), 2)
+];
+
+/* What the strip puts on screen, as record ids in the order they were first drawn.
+ *
+ * The strip draws one node per PIXEL COLUMN, so one record can own several columns and appear
+ * several times. Deduplicating is not softening the assertion — the claim it rests on is
+ * "every visible record is represented", and the old form ("one node per record") was a claim
+ * no reader could check at forty-two records to the pixel. Both are stated in the guard: the
+ * set equality below, and the column count further down. */
+const stripIds = () => {
+  const seen = new Set();
+  const out = [];
+  for (const n of sandbox.dom.overviewLanes.childNodes) {
+    const id = n.getAttribute('data-record-id');
+    if (id !== null && !seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
+};
+const listIds = () => sandbox.visibleEntries().map((e) => e.record.id);
+
+function resetStrip() {
+  sandbox.state.flat = STRIP.slice();
+  sandbox.state.kinds = ALL_KINDS;
+  sandbox.state.query = '';
+  sandbox.state.searchHits = null;
+  sandbox.state.overviewSelection = null;
+  sandbox.state.overviewViewport = null;
+  sandbox.state.anomaly.rules = [];
+  sandbox.state.rangeFrom = null;
+  sandbox.state.rangeTo = null;
+  sandbox.state.rangeCutoff = null;
+  sandbox.state.selectedId = null;
+}
+
+/* Render, then hold the strip to the list. Every case also states the rows outright, so a
+ * comparison cannot pass by both sides being empty — the failure mode a mirror assertion
+ * invites, and the one this section has the most reason to be suspicious of. */
+function stripIsTheList(name, expected) {
+  sandbox.renderOverview();
+  check(name + ': the rows under it', stripIds(), expected);
+  check(name + ': the strip draws exactly those rows', stripIds(), listIds());
+}
+
+resetStrip();
+stripIsTheList('strip under no filter', ['g1', 'g2', 'g3', 'g4', 'g5']);
+
+/* The kind axis, which the gate did list. Unchanged behaviour — and unchanged is the point:
+ * a fix that silently moved this one would be a fix that broke the case it looked right on. */
+resetStrip();
+sandbox.state.kinds = NO_TOOLS;
+stripIsTheList('strip under a kind filter', ['g1', 'g5']);
+
+/* The range axis. The gate did not list it, which is the defect: set a range and the strip
+ * went on drawing every span the list had already dropped. */
+resetStrip();
+sandbox.state.rangeTo = 1500;
+stripIsTheList('strip under a time range', ['g1', 'g2', 'g3']);
+
+/* The 异常 axis, which replaces the filter outright. Same shape of gap: tick one rule and the
+ * strip ignored it until a kind filter happened to be on as well. */
+resetStrip();
+sandbox.state.anomaly.rules = ['toolError'];
+stripIsTheList('strip under one 异常 rule', ['g4']);
+
+/* 异常 is exclusive by construction, so a kind filter left on beside it must change nothing —
+ * on either surface. If these two ever disagree the strip is not exclusive, whatever the
+ * button says. */
+resetStrip();
+sandbox.state.anomaly.rules = ['toolError'];
+sandbox.state.kinds = ['user'];
+stripIsTheList('strip under 异常 with a kind filter left on', ['g4']);
+
+/* The selected row is a deliberate exception, and an exception nobody asserts is one more
+ * thing the next reader cannot tell from a bug. Its scope is the viewport, not the filter:
+ * panning the strip must not delete the row the reader is on, while every other clipped span
+ * goes.
+ *
+ * The viewport is in the model's own position space — `overviewModel()` renumbers every span
+ * onto 0..n — so these bounds are fractions of the strip's width, not timestamps. Reading them
+ * as milliseconds does not fail loudly; the viewport simply reads as wider than the domain and
+ * nothing clips. */
+resetStrip();
+sandbox.state.overviewViewport = { start: 0, duration: 2.5 };
+sandbox.renderOverview();
+check('strip: panning the viewport draws only the spans still inside it',
+  stripIds(), ['g1', 'g2', 'g3']);
+sandbox.state.selectedId = 'g4';
+sandbox.renderOverview();
+check('strip: the selected row survives being panned off, since it is the row being read',
+  stripIds(), ['g1', 'g2', 'g3', 'g4']);
+
+/* And the brush itself is exempt, by argument rather than by omission: `spanPassesFilter`
+ * passes a null selection so the window you are dragging over does not erase its own
+ * contents. Asserted from the other side — with a brush in state, the list loses records and
+ * the strip does not. */
+resetStrip();
+sandbox.state.overviewSelection = { start: 1100, end: 1600 };
+sandbox.renderOverview();
+check('strip: a brush empties the list', listIds(), []);
+check('strip: and the strip keeps everything it is drawn over', stripIds(), ['g1', 'g2', 'g3', 'g4', 'g5']);
+
+resetStrip();
+sandbox.renderOverview();
+check('strip: with nothing filtered again the strip is whole',
+  stripIds(), ['g1', 'g2', 'g3', 'g4', 'g5']);
+
+/* ------------------------------------------------------------ one node per pixel column */
+/* What this pins: at 36,525 records the strip built 36,525 `.ov-span` nodes and rebuilt them on
+ * every poll that carried a body — 3,937 ms measured in the browser, against a 2.5s poll. The
+ * fix is aggregation, and an aggregation nobody can see from outside is indistinguishable from
+ * not having done it.
+ *
+ * The promise this layer makes is written out here because aggregation changes its SHAPE, not its
+ * truth. Two cases, and they are not the same claim:
+ *
+ *   strip wider than the record count — every record is bigger than a pixel, gets a column of
+ *     its own, and the old "the strip is the list" holds exactly. This is the case a reader can
+ *     check, and it is the one a zoomed-in view is always in.
+ *   strip narrower — records share a pixel and are indistinguishable there. What still holds is
+ *     that every record drawn is one the list kept, and that the strip covers every column the
+ *     records reach. "Every record appears" cannot be checked at forty-two records to the pixel,
+ *     and before aggregation it was not true either: the nodes were stacked, and what a reader
+ *     saw in each pixel was whichever record was painted last.
+ *
+ * `layoutWidth` is the one thing this fixture controls. 0 means "never laid out", which is the
+ * page's own fallback and gets its own assertion below. */
+
+const paintedColumns = () => [...new Set(sandbox.dom.overviewLanes.childNodes.map((n) => n.style.props['--ov-left']))].sort();
+const paintedIds = () => [...new Set(sandbox.dom.overviewLanes.childNodes.map((n) => n.getAttribute('data-record-id')))];
+
+resetStrip();
+sandbox.dom.overviewLanes.layoutWidth = 20;
+sandbox.renderOverview();
+check('a strip wider than the record count gives every record its own column',
+  stripIds(), ['g1', 'g2', 'g3', 'g4', 'g5']);
+check('and the column count follows the strip, not the records',
+  sandbox.overviewCache.columns, 20);
+check('so the strip and the list still say the same thing',
+  stripIds(), listIds());
+
+resetStrip();
+sandbox.dom.overviewLanes.layoutWidth = 3;
+sandbox.renderOverview();
+check('a strip narrower than the record count builds fewer nodes than there are records',
+  sandbox.dom.overviewLanes.childNodes.length < 5, true);
+check('the column count is the strip width', sandbox.overviewCache.columns, 3);
+check('nothing on the strip is a record the list dropped',
+  paintedIds().every((id) => listIds().includes(id)), true);
+check('and the strip covers every column the records reach',
+  paintedColumns(), ['0.0000%', '33.3333%', '66.6667%']);
+
+resetStrip();
+sandbox.dom.overviewLanes.layoutWidth = 0;
+sandbox.renderOverview();
+check('a strip that has never been laid out falls back to one column per record',
+  sandbox.overviewCache.columns, 5);
+check('not to a single column, which would be a solid block',
+  stripIds(), ['g1', 'g2', 'g3', 'g4', 'g5']);
+
+/* The selected and hovered records are the two things a column cannot say, so each gets its own
+ * node. Without them the strip would still be right and the reader would still be lost. */
+resetStrip();
+sandbox.dom.overviewLanes.layoutWidth = 20;
+sandbox.state.selectedId = 'g3';
+sandbox.renderOverview();
+check('the selected record has a node marked as the selected one',
+  sandbox.dom.overviewLanes.childNodes.filter(
+    (n) => n.getAttribute('data-record-id') === 'g3' && n.getAttribute('data-current') === 'true').length >= 1,
+  true);
+check('and it is marked as a record rather than as a column',
+  sandbox.dom.overviewLanes.childNodes.some((n) => n.getAttribute('data-current-marker') === 'true'), true);
+
+/* g3 is the record a 3px strip leaves without a column of its own — exactly the case the hover
+ * marker exists for, and exactly the case the old `document.elementFromPoint` hit-test could not
+ * reach. An earlier version of this guard called `markOverviewHover('g3')` directly, which passed:
+ * the id was injected, so nothing had to discover it. The whole defect lived on the other side of
+ * that call. So this drives the real pointer path with the DOM answering as the browser would —
+ * returning whichever column node is topmost — and asks for a record that owns none. */
+resetStrip();
+sandbox.overviewDrag = null;          // a brush left armed by an earlier case would take the
+                                       // drag branch and return before the hover is ever asked for
+// The track and the lanes are two different elements on the page: the track is the full strip the
+// pointer's x is measured against, the lanes are the domain window inset inside it. Giving the
+// stub one width for both makes `overviewFractionAt` answer 0 for every x, and every hover
+// assertion then quietly measures "the record nearest the start of the session".
+sandbox.dom.overviewTrack.layoutWidth = 1000;
+sandbox.dom.overviewLanes.layoutWidth = 3;
+sandbox.renderOverview();
+const crowdedModel = sandbox.overviewCache.model;
+const crowded = crowdedModel.spans.find((s) => s.id === 'g3');
+check('the crowded record is the one with no column of its own',
+  paintedIds().includes('g3'), false);
+
+// Whatever the browser hands back has to be a real, wrong answer for the test to mean anything.
+const domAnswer = sandbox.dom.overviewLanes.childNodes.find(
+  (n) => n.getAttribute('data-record-id') !== null && Number(n.style.props['--ov-lane']) === crowded.lane);
+check('the DOM can only answer with a different record in that lane',
+  domAnswer.getAttribute('data-record-id') !== 'g3', true);
+sandbox.document.elementFromPoint = () => domAnswer;
+
+const crowdedView = sandbox.overviewCache.view;
+const crowdedX = (((crowded.start + crowded.end) / 2 - crowdedView.start) / crowdedView.duration) * 1000;
+
+/* What the hit test RETURNS, asked of the function rather than of the handler that uses it.
+ *
+ * `client-check.mjs` can only read this one as source text, and enumerating the syntaxes that
+ * produce a key does not end: `hit.id`, `recordKey(hit.record)` and `hit.record.id` are three
+ * spellings of one defect, and a fourth is always available. Running it is what makes the check
+ * total — every one of them answers a string, and a span is not a string.
+ *
+ * Placed before the handler cases on purpose: a key-returning hit test also breaks those, so if
+ * this ran second the mutation would be attributed to whichever of them failed first and would
+ * never be given the name it is about. */
+const directHit = sandbox.spanAt(crowdedX, 8);
+/* Both reads go through the same guard. A hit test that answers null, or answers a key, must fail
+ * HERE BY NAME — `directHit.record.id` on a null throws, and a throw names no rule at all, which
+ * this suite treats as a weaker outcome than a red assertion and reports as UNNAMED. */
+const directIsSpan = directHit !== null && typeof directHit === 'object' && 'record' in directHit;
+check('the hit test hands back a span, not a key, whichever way it spells the lookup',
+  directIsSpan && 'id' in directHit, true);
+/* Shape is not enough, and a second acceptance review showed why: `{ id: hit.id, record: hit.record }`
+ * carries every field the shape check looks at and names the right record, so it passes — while
+ * being a different object from the one the hit test found. Click and hover act on this value, so
+ * what has to hold is that it IS the model's span, not that it resembles one. `crowded` is the very
+ * object out of `overviewCache.model.spans`, which is what `nearestSpanAt` returns by reference. */
+check('and it is that span itself, not something shaped like it',
+  directIsSpan && directHit === crowded, true);
+check('and the record it carries is the one under the pointer',
+  directIsSpan ? directHit.record.id : null, 'g3');
+
+sandbox.onOverviewPointerMove({ clientX: crowdedX, clientY: 8, pointerId: 3 });
+check('the hovered record comes from the model, not from the node under the pointer',
+  sandbox.state.overviewHoverId, 'g3');
+check('and it is drawn, since it has no column of its own',
+  sandbox.dom.overviewLanes.childNodes.some((n) => n.getAttribute('data-hovered-marker') === 'true'), true);
+check('and the mark is on that record',
+  sandbox.dom.overviewLanes.childNodes.filter((n) => n.getAttribute('data-hovered-marker') === 'true')
+    .map((n) => n.getAttribute('data-record-id')), ['g3']);
+
+// A point that is over no span at all must still answer with nothing, rather than snapping to
+// whatever record happens to be nearest in time.
+sandbox.document.elementFromPoint = () => sandbox.dom.overviewTrack;
+sandbox.onOverviewPointerMove({ clientX: crowdedX, clientY: 8, pointerId: 3 });
+check('a point over no span hovers nothing', sandbox.state.overviewHoverId, null);
+check('and leaves no marker behind',
+  sandbox.dom.overviewLanes.childNodes.some((n) => n.getAttribute('data-hovered-marker') === 'true'), false);
+check('and the columns are exactly as they were',
+  paintedColumns(), ['0.0000%', '33.3333%', '66.6667%']);
+
+/* ----------------------------------------------------------------- distance arithmetic
+ * The hit test resolves in TIME so that the answer is the record nearest the pointer rather than
+ * whichever one was painted last. Nothing above puts the pointer in a gap between two spans, and
+ * that is exactly where the two candidate distances are computed and compared — so a comparison
+ * written the other way round leaves every one of those assertions green.
+ *
+ * Subtracting the smaller time from the larger one leaves both distances positive and the `<`
+ * keeps the closer. Subtracting the other way leaves both NEGATIVE, which still admits the first
+ * candidate against Infinity and then keeps every LATER candidate that is further away: the strip
+ * answers with the record farthest from the pointer. Three spans in one lane make that visible,
+ * because nearest and farthest are different records.
+ *
+ * Expected values are derived by hand from the coordinates below, not read back out of the
+ * function, so this block can fail rather than merely agree with itself. */
+const D = (id, lane, start, end) => ({ id, lane, start, end, record: { id } });
+const restoreModel = sandbox.overviewCache.model;
+sandbox.overviewCache.model = {
+  start: 0,
+  end: 900,
+  // near-x sits in the next row and straddles the gap the lane-1 probes use.
+  spans: [D('near-l', 1, 0, 100), D('near-m', 1, 220, 300), D('near-r', 1, 400, 900),
+    D('near-d', 1, 600, 700), D('near-x', 2, 104, 116)],
+};
+const at = (time, lane) => { const s = sandbox.nearestSpanAt(time, lane); return s ? s.record.id : null; };
+
+// 110 is in the gap after near-l: 10ms from its end, 110ms from near-m's start, 290 from near-r's.
+check('a pointer in a gap resolves to the nearer of the two spans around it, not the further one',
+  at(110, 1), 'near-l');
+// 390 is in the gap before near-r: 90ms from near-m's end, 10ms from near-r's start, 290 from near-l's.
+check('and the same when the nearer span is on the other side of the pointer', at(390, 1), 'near-r');
+/* 370 is the case that pins BOTH distance expressions on their own, so neither one can be the
+ * only thing carrying the rule: 30ms from near-r's start, 230 from near-d's start, 70 from near-m's
+ * end, 270 from near-l's. Flipping either subtraction turns its own candidates negative, and the
+ * further one of that side then wins — the `span.start > time` side has two candidates here, so it
+ * is distinguishable from the case above where it has only one. */
+check('with two spans on the same side, it is still the nearer one that wins', at(370, 1), 'near-r');
+// 150 with no row: near-x is 34ms away, near-l 50, near-m 70, near-r 250 — so a second row does
+// compete, which is the click fallback's case: it has no row to offer.
+check('a pointer with no row given is answered from every row', at(150), 'near-x');
+// Past the whole session every span is behind the pointer, so the nearest is the one that ENDS
+// last — near-r, at 100ms — not the one that ends first (900ms) and not the last in the array
+// (near-d ends at 700, which is 300ms away).
+check('a pointer past the whole session resolves to the last span, not the first', at(1000, 1), 'near-r');
+check('and one before it, to the first, not the last', at(-50, 1), 'near-l');
+// near-x contains 110 exactly, so with no row it wins outright; with lane 1 it is not consulted
+// at all, and the row the pointer is actually over answers instead.
+check('the row is a filter and not a preference: a span in another row is not consulted', at(110, 1), 'near-l');
+sandbox.overviewCache.model = restoreModel;
 
 /* ----------------------------------------------------------------------- report */
 console.log('overview + toolbar controls: ' + pass + ' passed, ' + failures.length + ' failed');

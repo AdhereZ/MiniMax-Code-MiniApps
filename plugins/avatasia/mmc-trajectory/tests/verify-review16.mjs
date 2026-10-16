@@ -12,9 +12,12 @@
  * a rule. mutate-review16.py breaks each of these in the shipped file and requires this guard to
  * report it by name.
  */
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, rmSync, mkdirSync,
+         cpSync, mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { join, basename } from 'node:path';
+import { join, basename, dirname, relative, isAbsolute } from 'node:path';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const PKG = join(HERE, '..');
@@ -51,6 +54,7 @@ const SHIPPED_TEXT = {
   'README.zh-CN.md': readmeZh,
   'miniapp/client/index.html': clientHtml,
   'miniapp/node/server.mjs': serverJs,
+  'miniapp/node/search-segments.mjs': read('miniapp/node/search-segments.mjs'),
   'tests/make-fixtures.mjs': read('tests/make-fixtures.mjs'),
   'tests/client-check.mjs': read('tests/client-check.mjs'),
   '.minimax-plugin/plugin.json': read('.minimax-plugin/plugin.json'),
@@ -284,19 +288,26 @@ assert('neither README still announces the old version',
 // snapshot planted by hand plus one real mutation in index.html, `node tests/run.mjs
 // verify-ledger-jump` printed `0/1 guards passed / failed: verify-ledger-jump.mjs` and one line
 // about nothing being left over.
+// Pinned to the one return expression that exists for this, not to a bare `readFileSync(SNAPSHOT`
+// and not to a lazy span from `readSnapshot` onwards — the runner's self-test reads the snapshot too,
+// and both looser forms are satisfied by that, so a mutation removing the harness's own read leaves
+// the assertion green. The cost of this one was 38 of 39 mutations caught.
 assert('the harness reads the snapshot the previous run wrote',
-  /readFileSync\(SNAPSHOT,/.test(runMjs));
+  /return existsSync\(SNAPSHOT\) \? JSON\.parse\(readFileSync\(SNAPSHOT, 'utf8'\)\) : null;/.test(runMjs));
 assert('the startup comparison is per file, against the digest that was recorded',
-  /previous\[rel\] !== undefined && previous\[rel\] !== digest\(rel\)/.test(runMjs));
+  /!== undefined && \w+\[rel\] !== digest\(rel\)/.test(runMjs));
 // A checkout nobody has run the suite on has no baseline. Treating that as "everything differs"
 // would warn on every first run, and treating it as a failure would fail every fresh clone.
 assert('a missing baseline is neither a difference nor a failure',
   /const readSnapshot = \(\) => \{[\s\S]*?return null;/.test(runMjs)
   && /const leftover = previous\s*\?/.test(runMjs));
-// Reported, not failed. The suite runs on machines with uncommitted work, and "these files are not
-// what the last run left" is true of a contributor mid-edit. So this must never reach `failed`.
+// Reported, not failed. The suite runs on machines with uncommitted work, and "these files are
+// not what the last run left" is true of a contributor mid-edit. So this must never reach
+// `failed`. The check is structural -- a WARN line exists, and `leftover` reaches no `failed`
+// call -- because the alternative was a regex for the wording, which is a test of the message
+// rather than of the rule, and which this suite has now been bitten by for both of these.
 assert('files that differ from the last run are reported and not failed',
-  /shipped files differ from the last run/.test(runMjs)
+  /console\.log\(`WARN/.test(runMjs)
   && !/failed\.push\([^\n]*leftover/.test(runMjs));
 // Written on every clean run. Gating the write on the file already existing is what left a fresh
 // checkout with nothing to compare against — the machine least likely to have a stale snapshot is
@@ -310,13 +321,194 @@ assert('the snapshot records the state the run ended with, and only a clean end'
   /if \(drift\.length === 0\) \{[\s\S]*?writeFileSync\(SNAPSHOT/.test(runMjs)
   && !/JSON\.stringify\(snapshotBefore\)/.test(runMjs));
 // Two findings, two names. Collapsing them into one line is the regression this section exists to
-// stop: "shipped files restored" means this run dirtied the source, "differ from the last run"
-// means it was already dirty, and a reader who cannot tell them apart cannot act on either.
+// stop: one label means this run dirtied the source, the other means it was already dirty, and a
+// reader who cannot tell them apart cannot act on either.
+//
+// Read the two labels back out of the file and compare them, rather than matching either against a
+// literal. Pinning the exact words made this a check on the message, not on the rule, and the round
+// that changed the residue label broke it for no reason a reviewer could have acted on.
+const warnLabel = /console\.log\(`WARN\s+\$\{'([^']+)'/.exec(runMjs);
+const failLabel = /console\.log\(`FAIL\s+\$\{'([^']+)'/.exec(runMjs);
 assert('this run\'s own residue and last run\'s residue are named differently',
-  /shipped files restored/.test(runMjs)
-  && /shipped files differ from the last run/.test(runMjs)
-  && /WARN/.test(runMjs));
+  warnLabel !== null && failLabel !== null && warnLabel[1] !== failLabel[1]);
+// Run the harness against a copy of the package in a temp directory, never against this one.
+//
+// That sentence is the fix for a family of problems this file spent several revisions creating. The
+// state under test is "a package with no baseline", and a scratch copy is in exactly that state by
+// construction -- nobody had to delete anything to get there. Nothing is shared, so nothing another
+// process can reach, so there is no lock to key, no key to canonicalise, no owner to record, and no
+// way for a recycled pid to impersonate one. Four concurrent invocations of the version that moved
+// the real baseline aside deleted it outright, and a hard kill left a lock file in the temp directory
+// that the residue check cannot see and that kept every later run out. `cpSync` is one call.
+// Is `child` this package or somewhere under it? The scratch destination is refused when it is,
+// because a copy of the package into its own subtree is exactly what `cpSync` declines to do, and it
+// declines by throwing -- which would take this guard down before any assertion ran, on a machine
+// whose TEMP simply points somewhere unusual.
+//
+// Physical identity, not lexical. A temporary directory reached through a junction that points back
+// here is inside the package even though no string in it says so, and on that machine cpSync refuses
+// the copy by luck rather than by decision. The destination does not exist yet, so its parent is what
+// gets resolved and the last segment is put back.
+//
+// The alias case itself is not exercised below: making a junction needs a privilege this suite does not
+// assume, and a mutation that only differs under an alias would survive rather than fail.
+const insidePackage = (child) => {
+  let target = child;
+  try {
+    target = join(realpathSync.native(dirname(child)), basename(child));
+  } catch { /* a parent that is not there has nothing to resolve */ }
+  const rel = relative(realpathSync.native(PKG), target);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+};
 
+// One path, not one basename. `basename(src) !== '.shipped-snapshot.json'` also drops every file
+// with that name anywhere in the tree, so the copy stops being "the package without its bookkeeping
+// file" and becomes "the package without anything so named" -- a difference no assertion would have
+// noticed while the tree happened to hold no second one.
+//
+// A factory, not a constant over PKG, and the reason is a property this file could not check for a
+// year of looking: the filter's promise is "the copy has no baseline EVEN WHEN THE SOURCE HAS
+// ONE", and the only source available here is the package this guard is sitting in -- whose
+// baseline file is gitignored and therefore ABSENT on every fresh clone and on CI. There, a filter
+// that excluded nothing and this one produced identical copies, so `filter: () => true` survived
+// and the mutation counted 46/47 on a clean checkout while counting 47/47 on a developer machine
+// that had run the suite. Given a root, the same predicate can be asked about a source built here,
+// where a baseline is planted on purpose and its absence in the copy is therefore a fact about the
+// filter rather than about what happened to be lying around.
+const notTheBaselineIn = (root) => (src) => relative(root, src) !== join('tests', '.shipped-snapshot.json');
+const notTheBaseline = notTheBaselineIn(PKG);
+
+const scratchPackage = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mmc-trajectory-selfcheck-'));
+  if (insidePackage(dir)) {
+    rmSync(dir, { recursive: true, force: true });
+    const e = new Error('the temporary directory is inside the package; set TEMP somewhere else');
+    e.code = 'ERR_SCRATCH_INSIDE_PACKAGE';
+    throw e;
+  }
+  try {
+    cpSync(PKG, dir, {
+      recursive: true,
+      filter: notTheBaseline,
+    });
+  } catch (err) {
+    // The caller cannot clean up a path it was never handed, so this function has to.
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+  return dir;
+};
+
+assert('the copy leaves out the bookkeeping file and nothing else',
+  notTheBaseline(join(PKG, 'tests', '.shipped-snapshot.json')) === false
+  && notTheBaseline(join(PKG, 'fixtures', '.shipped-snapshot.json')) === true
+  && notTheBaseline(join(PKG, 'tests', 'run.mjs')) === true,
+  'pkg=' + PKG);
+
+/* Asking the predicate about a path only proves it reads paths correctly. What the filter is FOR is
+ * a property of a finished copy, and that one cannot be read off a path at all -- it has to be
+ * produced. The source is built here rather than borrowed, so it holds a baseline on every machine:
+ * `tests/.shipped-snapshot.json` is gitignored, so the real package has none on a fresh clone, and
+ * a copy of a source with nothing in it cannot tell this filter from `() => true`. That is not a
+ * theoretical gap -- with the filter neutered the mutation control reported 46/47 on a clean
+ * checkout and 47/47 only where an earlier suite run had left the file behind. */
+const filterSource = mkdtempSync(join(tmpdir(), 'mmc-trajectory-filtersrc-'));
+let filterCopy = null;
+try {
+  mkdirSync(join(filterSource, 'tests'), { recursive: true });
+  mkdirSync(join(filterSource, 'fixtures'), { recursive: true });
+  writeFileSync(join(filterSource, 'tests', '.shipped-snapshot.json'), '{"planted":"as-a-baseline"}');
+  writeFileSync(join(filterSource, 'fixtures', '.shipped-snapshot.json'), '{"planted":"under-fixtures"}');
+  writeFileSync(join(filterSource, 'tests', 'run.mjs'), '// planted\n');
+  filterCopy = mkdtempSync(join(tmpdir(), 'mmc-trajectory-filterdst-'));
+  cpSync(filterSource, filterCopy, { recursive: true, filter: notTheBaselineIn(filterSource) });
+  assert('a copy of a source that carries the bookkeeping file still comes out without it',
+    existsSync(join(filterSource, 'tests', '.shipped-snapshot.json'))
+    && !existsSync(join(filterCopy, 'tests', '.shipped-snapshot.json')),
+    'src=' + filterSource + ' dst=' + filterCopy);
+  assert('and it comes out without it by path, keeping the file of the same name under fixtures/',
+    existsSync(join(filterCopy, 'fixtures', '.shipped-snapshot.json'))
+    && existsSync(join(filterCopy, 'tests', 'run.mjs')),
+    'dst=' + filterCopy);
+} finally {
+  rmSync(filterCopy, { recursive: true, force: true });
+  rmSync(filterSource, { recursive: true, force: true });
+}
+
+// The predicate above is what decides whether the copy is attempted at all, and the whole guard hangs
+// off it, so it is checked against paths with known answers rather than trusted.
+assert('a path under the package is recognised as under the package',
+  insidePackage(PKG) && insidePackage(join(PKG, 'tests', 'scratch'))
+  && !insidePackage(join(PKG, '..', 'scratch'))
+  && !insidePackage(join(tmpdir(), 'mmc-trajectory-selfcheck-elsewhere')),
+  'pkg=' + PKG + ' tmp=' + tmpdir());
+
+const GONE = 'tests/__absent-probe__.mjs';
+let scratch = null;
+let sawBaseline = null;
+let selfTest = { status: null, stdout: '', stderr: '' };
+let wiring = { status: null, stdout: '' };
+let scratchError = null;
+try {
+  scratch = scratchPackage();
+  const harness = join(scratch, 'tests', 'run.mjs');
+  const there = (...args) => spawnSync(process.execPath, [harness, ...args],
+    { cwd: scratch, encoding: 'utf8' });
+
+  // Read the state back off the copy rather than reasoning about it. "The filter excludes the
+  // baseline" is a claim about a line of code; this is the file system answering.
+  sawBaseline = existsSync(join(scratch, 'tests', '.shipped-snapshot.json'));
+  selfTest = there('--self-test-residue');
+
+  // And the wiring, which nothing above can reach: those phases build their own input and hand it
+  // straight to the comparison, so they measure the comparison function and say nothing about whether
+  // the startup hands it one at all. Planting a baseline and asking the harness what its own startup
+  // made of that measures the part with no other check. The harness picks no input here -- and here it
+  // is planting into a directory this process created, so the question of whose file that is does not
+  // arise.
+  writeFileSync(join(scratch, 'tests', '.shipped-snapshot.json'),
+    JSON.stringify({ [GONE]: 'planted-by-verify-review16' }));
+  wiring = there('--print-startup-leftover');
+} catch (err) {
+  // Named rather than thrown. A machine whose TEMP points inside the package cannot produce the state
+  // under test, and saying so is a result; an uncaught exception out of here is the reading that looks
+  // exactly like a surviving mutation.
+  scratchError = err.code || String(err);
+} finally {
+  if (scratch !== null) rmSync(scratch, { recursive: true, force: true });
+}
+
+assert('the residue self-test runs on a package that has no baseline',
+  scratchError === null && sawBaseline === false, 'scratchError=' + scratchError + ' sawBaseline=' + sawBaseline);
+{
+  const say = 'exit=' + selfTest.status + ' out=' + JSON.stringify((selfTest.stdout || '').slice(0, 200))
+    + ' err=' + JSON.stringify((selfTest.stderr || '').slice(0, 160));
+  // Two phases, two assertions, two mutations. One assertion covering both would let either
+  // direction fail alone while the other still passes, which is how the first version of this
+  // reported an exhaustive check that was silent about a deleted file.
+  assert('the residue check names a file the old hand-maintained list did not cover',
+    selfTest.status === 0 && /^caught /m.test(selfTest.stdout || ''), say);
+  assert('the startup comparison names a path the last run recorded and this tree no longer has',
+    selfTest.status === 0 && /^caught-absent /m.test(selfTest.stdout || ''), say);
+}
+// Parsed, not matched. Substring membership was enough to pass while the mode printed anything at all
+// that mentioned the path -- a debug line, an error, a hard-coded string. What has to hold is the
+// shape the mode promises: a baseline was read, and the one path the planted baseline recorded is the
+// one it named, and nothing else was.
+//
+// `warned` is the part that cannot be read off the computed values. A comparison that runs correctly
+// and a comparison whose result is then gated out of the warning look identical from here, and the
+// whole point of the residue check is that somebody is told. So the mode reports which branch it took.
+const wiringLine = /^startup-leftover=(.*)$/m.exec(wiring.stdout || '');
+let payload = null;
+try {
+  payload = JSON.parse(wiringLine === null ? '' : wiringLine[1]);
+} catch { payload = null; }
+assert('the startup comparison warns when the baseline records a difference',
+  wiring.status === 0 && payload !== null && payload.hadBaseline === true && payload.warned === true
+  && Array.isArray(payload.leftover) && payload.leftover.length === 1
+  && payload.leftover[0] === GONE,
+  'exit=' + wiring.status + ' payload=' + JSON.stringify(payload).slice(0, 200));
 console.log('[review16] ' + pass + ' passed, ' + failures.length + ' failed');
 if (failures.length) {
   console.log('FAILURES:\n - ' + failures.join('\n - '));

@@ -44,10 +44,13 @@ MUTATIONS = [
      "'提问待答 ' + formatInt(asked)\n        ];",
      "turn breakdown renders 提问轮, not 提问待答"),
     # Removing 另有 is the exact regression this guard exists for: the two groups go back to
-    # being one undifferentiated `·` run.
+    # being one undifferentiated `·` run. The anchor follows the separator to where it now
+    # lives: it used to sit in turnContextSuffix(), which was retired as dead, and the live
+    # presenter turnSubNode() writes the same boundary itself. The regression is unchanged —
+    # only the line it happens on.
     ("boundary mark 另有 removed",
-     "   ·   另有 ' + context",
-     "   ·   ' + context",
+     "wrap.appendChild(document.createTextNode('   ·   另有 '));",
+     "wrap.appendChild(document.createTextNode('   ·   '));",
      "context group is marked as a separate population"),
     ("whole breakdown and context line claims to sum to the headline",
      OPENED,
@@ -81,6 +84,18 @@ MUTATIONS = [
      "'收尾 ' + formatInt(Math.max(0, total - open)) + ' · 答复在本轮内交付',",
      "'这一类轮次在本轮内交付了答复',",
      "the tip explains every term on the line"),
+    # ...and the whole shape behind them is a hand-copied second of the server's stats, held in a
+    # different process. Dropping one declared field leaves `undefined + 1` in the loop, which is
+    # NaN, and NaN is refused by isCount() — so 「追加 N」 disappears from the card the moment a
+    # time range goes on, while the whole-session card (reading the server's stats) keeps showing
+    # it. Both numbers were right and nothing said so. The guard for it reads the two halves off
+    # the function rather than off a hardcoded field list, because the hardcoded list is what let
+    # this through the first time: `steers` was simply not written down in it.
+    ("the re-scoped stats loses the field the server declares",
+     "          steers: 0,\n          toolCalls: 0,",
+     "          toolCalls: 0,",
+     "every stats field scopedStats writes is one it declares"),
+
     # The original defect: title and header both said 轮次, one a total one an ordinal. Put the
     # shared label back on either side and the two numbers look like they should be equal.
     ("turn header reverts to the shared label",
@@ -91,12 +106,12 @@ MUTATIONS = [
     # 第 82 轮, two scopes in one label, so the pair reads as a contradiction that no wording
     # can fix. Both numbers were true.
     ("session total put back in the title",
-     "if (!isCount(firstTurn) || !isCount(lastTurn)) return DASH;",
-     "if (!isCount(firstTurn) || !isCount(lastTurn)) return DASH;\n        var totalTurns = state.payload.stats.turns;\n        if (firstTurn === lastTurn) return '共 ' + formatInt(totalTurns) + ' 轮 · 当前第 ' + formatInt(firstTurn) + ' 轮';\n        return '共 ' + formatInt(totalTurns) + ' 轮 · 当前第 ' + formatInt(firstTurn) + '–' + formatInt(lastTurn) + ' 轮';",
+     "        var range = DASH;\n        if (isCount(firstTurn) && isCount(lastTurn)) {",
+     "        var range = DASH;\n        if (isCount(state.payload && state.payload.stats ? state.payload.stats.turns : null)) return '共 ' + formatInt(state.payload.stats.turns) + ' 轮';\n        if (isCount(firstTurn) && isCount(lastTurn)) {",
      "panel title states only the rendered turn range"),
     ("title drops the range entirely",
-     "return '第 ' + formatInt(firstTurn) + '–' + formatInt(lastTurn) + ' 轮';",
-     "return '轨迹';",
+     ": '第 ' + formatInt(firstTurn) + '–' + formatInt(lastTurn) + ' 轮';",
+     ": '轨迹';",
      "panel title states only the rendered turn range"),
     # Anchored on two lines with their indentation: updateWindowBar() now writes the 全场 total in
     # both its mid-build and its settled branch, and a one-line anchor matches both.

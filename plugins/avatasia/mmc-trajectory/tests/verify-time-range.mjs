@@ -14,27 +14,190 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { buildMessageIdentity, buildTrajectoryPayload, openerRowsForView } from '../miniapp/node/server.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const HTML = join(HERE, '..', 'miniapp', 'client', 'index.html');
 
-// NOT part of `run.mjs`, and deliberately so. Its assertions are calibrated against a full
-// multi-generation session -- `stats.messages > 1000`, and a checkpoint that sits inside a turn
-// rather than being one -- and the committed fixture is a single-file session of a few dozen
-// rows. Reproducing those numbers faithfully would mean committing a multi-megabyte payload.
-// Relaxing them to fit would be worse: the point of this file is the timezone arithmetic, which
-// a small window would stop exercising.
-//
-// Run it against a booted service instead:
-//   node tests/verify-time-range.mjs <port>
-const port = process.argv[2];
-if (!port) {
-  console.error('usage: node verify-time-range.mjs <port>   (needs a running Mini App)');
-  process.exit(2);
-}
-const BASE_URL = 'http://127.0.0.1:' + port;
-
 const html = readFileSync(HTML, 'utf8');
+
+/* ---------- the session section 3 runs against ---------- */
+// WHY IT IS BUILT HERE. This file was excluded from `run.mjs` for its whole life, and the reason
+// was always the input: its assertions want a session with more than a thousand messages spanning a
+// local midnight, and the only one available was whatever the machine running the service happened
+// to have. The committed fixture is sixty rows of one afternoon. So the file sat in the directory,
+// looked like coverage, and proved nothing — 509 lines of timezone arithmetic that no run exercised.
+//
+// Relaxing the numbers to fit the fixture was the alternative on the table and it is worse: the
+// whole point of the file is that a bound is a subtraction, and a window that no longer crosses a
+// midnight stops exercising the machine's distance from Greenwich at all.
+//
+// Committing a multi-megabyte real transcript was the other alternative. Rejected: it puts a
+// session's contents in the package, and this is a fixture, not a corpus.
+//
+// So the transcript is synthetic and built here, and it is handed to the server's OWN
+// `buildTrajectoryPayload` — the same exported function the `/api/trajectory` route calls. What is
+// synthetic is the conversation; the `stats` this compares against is still computed by the code
+// under test, in the file that serves it. Section 3 asks "does the page's re-derivation agree with
+// the server's numbers", and both sides of that question are still the real implementations.
+//
+// Four properties are load-bearing, and none of them is "big":
+//
+//   - over a thousand messages, or the half-range comparison compares two numbers too close to tell
+//   - a local midnight with rows on both sides of it, or the wall-clock arithmetic is never exercised
+//   - EVERY field section 3 compares is non-zero, or the comparison is `0 === 0`: green, and not
+//     evidence of anything. That includes the two compaction counters, so the session carries a
+//     turn that is nothing but a checkpoint. Leaving them at zero looked like a deliberate choice
+//     — "no bare checkpoint turn, or the two sides re-derive different populations" — and it was
+//     exactly backwards: it meant `stats.compactions += 1` and `stats.compactionTurns += 1` could
+//     both be deleted from the page and this guard would still pass. A turn that is nothing but a
+//     checkpoint is also the only way that branch of the classifier is reachable, so it is what
+//     makes the two counters comparable rather than assumed. The product invariant that a real
+//     session has none of these belongs to `verify-compaction-turn.mjs`; asserting it here proved
+//     nothing, because the number it asserted was this file's own choice.
+const SYNTHETIC_TURNS = 400;
+// Eight hours from 20:00 local puts the midnight four hours in, with roughly half the records on
+// each side of it — dense enough that the ±5 minute window section 3b picks is never empty, and
+// spread thinly enough that the window stays far under the tenth-of-the-session slice it asserts.
+const SYNTHETIC_SPAN_MS = 8 * 3600 * 1000;
+
+/**
+ * A local wall-clock instant far enough from any daylight-saving step to span one safely.
+ *
+ * Anchored to the calendar rather than to a UTC instant on purpose: the crossing under test is a
+ * LOCAL midnight, so a fixed UTC start would place it somewhere else on every other machine's
+ * clock and the file would be testing the store's timezone instead of the arithmetic. The retry is
+ * for the remaining case — a zone whose transition falls inside the eight hours, where the wall
+ * clock moves without `relativeMs` moving and the two readings section 3b compares part company.
+ *
+ * @returns {number} epoch ms
+ */
+function syntheticStart() {
+  let start = new Date(2026, 9, 10, 20, 0, 0).getTime();
+  for (let guard = 0; guard < 14; guard += 1) {
+    const offset = new Date(start).getTimezoneOffset();
+    if (offset === new Date(start + SYNTHETIC_SPAN_MS).getTimezoneOffset()) return start;
+    start = new Date(2026, 9, 10 + guard + 1, 20, 0, 0).getTime();
+  }
+  return start;
+}
+
+/**
+ * @returns {Array<Record<string, any>>} rows in the file shape the store keeps
+ */
+function buildRows(start) {
+  /** @type {Array<{ turn: string, message: Record<string, any>, stamp: number }>} */
+  const plan = [];
+  let at = 0;
+  const add = (turnId, message) => {
+    at += 1;
+    plan.push({ turn: turnId, message, stamp: at });
+  };
+  const assistant = (t, blocks, stopReason) => ({
+    role: 'assistant',
+    content: blocks,
+    api: 'synthetic-api', provider: 'synthetic-provider', model: 'synthetic-model',
+    usage: {
+      input: 1000 + t, output: 40 + (t % 17), cacheRead: 9000 + t * 2, cacheWrite: 7 * t,
+      totalTokens: 1000 + t + 40 + (t % 17) + 9000 + t * 2 + 7 * t,
+    },
+    stopReason,
+  });
+  const thinking = (t) => ({ type: 'thinking', thinking: 'synthetic reasoning ' + t, thinkingSignature: 'sig-' + t });
+
+  for (let t = 1; t <= SYNTHETIC_TURNS; t += 1) {
+    const turnId = 'turn-' + String(t).padStart(4, '0');
+
+    // Every twelfth turn is the model resuming without a new reader message — the shape the
+    // server files as a continuation. It needs a `reply` record to be closed, otherwise it lands
+    // in `turnsWithoutPrompt` instead and the classifier's second branch is never taken.
+    if (t % 12 === 5) {
+      add(turnId, assistant(t, [thinking(t), { type: 'text', text: 'synthetic resumed ' + t }], 'stop'));
+      continue;
+    }
+
+    // Every twenty-third turn is a checkpoint that opened a turn the file never named — the only
+    // shape the server classifies as `compaction`, and the reason the two compaction counters are
+    // compared rather than assumed. Without it the page's `+= 1` for either one could be deleted
+    // and every assertion below would still pass on `0 === 0`.
+    if (t % 23 === 7) {
+      add(turnId, {
+        role: 'compactionSummary',
+        summary: 'synthetic checkpoint ' + t,
+        tokensBefore: 1000 + t,
+      });
+      continue;
+    }
+
+    // Every seventeenth turn has neither an opener nor a closing reply, so the classifier falls
+    // through to its last branch. Left uncovered, the page's `else` arm was being compared with
+    // the server's against zero.
+    if (t % 17 === 3) {
+      add(turnId, assistant(t, [
+        thinking(t),
+        { type: 'text', text: 'synthetic unfinished ' + t },
+        { type: 'toolCall', id: 'call_' + t + '_0', name: 'tool_' + (t % 7), arguments: { n: t } },
+      ], 'toolUse'));
+      add(turnId, {
+        role: 'toolResult',
+        toolCallId: 'call_' + t + '_0',
+        toolName: 'tool_' + (t % 7),
+        content: [{ type: 'text', text: 'synthetic result ' + t }],
+        isError: false,
+      });
+      continue;
+    }
+
+    add(turnId, { role: 'user', content: [{ type: 'text', text: 'synthetic prompt ' + t }] });
+
+    // `closed` is not a stop reason: the server sets it from a record of kind `reply`, and that
+    // kind is assigned from the literal string `stop` — anything else projects as `narration`. So a
+    // turn only closes when a second assistant row follows its tool results carrying `'stop'`, and
+    // a generator that omits it — or spells it `'endTurn'` — leaves every turn open.
+    const asks = t === SYNTHETIC_TURNS;
+    const open = asks || t % 9 === 4;
+    const callIds = ['call_' + t + '_0', 'call_' + t + '_1'];
+    // The last turn calls a tool whose answer arrives through the tool, which is what makes it a
+    // question to the reader (`qaTurns`) rather than just an unfinished turn.
+    const callNames = asks ? ['ask_user', 'tool_' + (t % 7)] : ['tool_' + (t % 7), 'tool_' + ((t + 3) % 7)];
+    add(turnId, assistant(t, [
+      thinking(t),
+      { type: 'text', text: 'synthetic answer ' + t },
+      { type: 'toolCall', id: callIds[0], name: callNames[0], arguments: { n: t } },
+      { type: 'toolCall', id: callIds[1], name: callNames[1], arguments: { n: t } },
+    ], 'toolUse'));
+
+    // Two tool results, and every ninth one fails — so `errors` is non-zero and the
+    // de-duplication of errors by message id has something to de-duplicate.
+    for (let c = 0; c < 2; c += 1) {
+      add(turnId, {
+        role: 'toolResult',
+        toolCallId: callIds[c],
+        toolName: callNames[c],
+        content: [{ type: 'text', text: 'synthetic result ' + t + '.' + c }],
+        isError: (t + c) % 9 === 0,
+      });
+    }
+
+    if (!open) add(turnId, assistant(t, [thinking(t), { type: 'text', text: 'synthetic close ' + t }], 'stop'));
+    // A prompt typed while the turn was still running. The server projects a user row that is not
+    // its turn's opener as a steer rather than as a message, so without one `steers` is 0 on both
+    // sides and the check degenerates to comparing 0 with 0.
+    else if (!asks) add(turnId, { role: 'user', content: [{ type: 'text', text: 'synthetic steer ' + t }] });
+  }
+
+  // Timestamps are laid over the span only once the row count is known, so the density does not
+  // depend on how many rows a turn happens to contribute.
+  const step = SYNTHETIC_SPAN_MS / plan.length;
+  return plan.map((entry, i) => ({
+    message_id: 'msg-' + String(i + 1).padStart(5, '0'),
+    turn_id: entry.turn,
+    message: { ...entry.message, timestamp: start + Math.round(i * step) },
+  }));
+}
+
+const SYNTHETIC_START = syntheticStart();
+const SYNTHETIC_ROWS = buildRows(SYNTHETIC_START);
 
 /* ---------- helpers ---------- */
 let pass = 0;
@@ -242,8 +405,34 @@ assert('the unreadable branch names the range still in force', /hasTimeRange\(\)
   assert('and does not blame the value', noBase.textContent.indexOf('无法识别') < 0);
 }
 
-/* ---------- 3) against the live session ---------- */
-const payload = await (await fetch(BASE_URL + '/api/trajectory')).json();
+/* ---------- 3) against a projected session ---------- */
+// The one line that used to be `await fetch(BASE_URL + '/api/trajectory')`. Same builder, no
+// service: what the route adds around `buildTrajectoryPayload` is a handful of `session.*` fields
+// this file never reads, which is the same observation `make-payload.mjs` is built on.
+//
+// IT IS A GENERATION VIEW OVER A LINEAGE, not the whole conversation in one pass, and that is not
+// tidiness — it is what makes `messagesAll` testable. `messagesAll` counts the conversation;
+// `messages` counts what this view holds. When the two are the same number, re-scoping the whole
+// figure on the page is undetectable, and that is precisely the rule the assertion below states.
+// A single-view fixture made them equal, and 「全程 N」 was a comparison of the page with itself.
+const GENERATION_SIZE = 100;
+const FIRST_VIEWED_GENERATION = 1; // the view is generations 1..3 — it straddles the local midnight
+const generationOf = (row) => Math.floor((Number(row.turn_id.slice(5)) - 1) / GENERATION_SIZE);
+
+const occurrences = SYNTHETIC_ROWS.map((row) => ({ row, generation: generationOf(row), locator: null }));
+const identity = buildMessageIdentity(occurrences);
+const viewOccurrences = occurrences.filter((o) => o.generation >= FIRST_VIEWED_GENERATION);
+const viewRows = viewOccurrences.map((o) => o.row);
+
+const payload = buildTrajectoryPayload({
+  session: { id: 'mvs_0000000000000000000000000000000f', createdAtMs: SYNTHETIC_START },
+  rows: viewRows,
+  identity,
+  openerByTurn: openerRowsForView(identity, viewOccurrences),
+  sizeBytes: viewRows.length,
+  truncated: false,
+  generations: [],
+});
 
 const scoped = { console, state: { payload, flat: [], rangeFrom: null, rangeTo: null, rangeCutoff: null } };
 scoped.state.flat = payload.turns.flatMap((turn) => turn.records.map((record) => ({ turn, record })));
@@ -276,20 +465,49 @@ const whole = scoped.scopedStats();
 const FIELDS = [
   'messages', 'userMessages', 'toolCalls', 'toolResults', 'thinkingBlocks', 'errors',
   'compactions', 'turnsWithPrompt', 'continuationTurns', 'qaTurns', 'openTurns',
-  'turnsWithoutPrompt', 'compactionTurns', 'durationMs'
+  'turnsWithoutPrompt', 'compactionTurns', 'durationMs',
+  // Added 2026-10-15. This list is hand-written, and `steers` was missing from it — so the one
+  // field the re-scoped stats had actually lost went unchecked. `client-check.mjs` now reads both
+  // halves off the function itself, which is what stops the NEXT one; this entry is the direct
+  // number check for this one.
+  'steers'
 ];
+const TOKEN_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'];
 for (const field of FIELDS) {
   check('whole-session ' + field, whole[field], payload.stats[field]);
 }
-for (const field of ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']) {
+for (const field of TOKEN_FIELDS) {
   check('whole-session tokens.' + field, whole.tokens[field], payload.stats.tokens[field]);
+}
+
+// The precondition of every comparison above, asserted for all twenty numbers rather than for the
+// two that happened to break first. `0 === 0` is not evidence that the page counts a field; it is
+// evidence that nothing counted it and both sides agreed. This used to read `compactionTurns === 0`
+// — the fixture guaranteeing the precondition of the comparison it was about to perform, so the
+// page's `+= 1` could be deleted outright and the guard stayed green. The other eighteen fields were
+// in exactly that state and nothing said so, which is the same defect one field narrower. Driven off
+// FIELDS, so the next field added to that list arrives covered instead of waiting to be discovered.
+for (const field of FIELDS) {
+  assert('the fixture makes ' + field + ' non-zero, so the page is counted against something',
+    typeof payload.stats[field] === 'number' && payload.stats[field] !== 0);
+}
+for (const field of TOKEN_FIELDS) {
+  assert('the fixture makes tokens.' + field + ' non-zero, so the page is counted against something',
+    typeof payload.stats.tokens[field] === 'number' && payload.stats.tokens[field] !== 0);
 }
 
 // The one field that must NOT be re-scoped: 「全程 N」 beside the range is the comparison the
 // reader wants, and re-scoping it would leave the note with nothing to say.
 check('messagesAll stays whole-session', whole.messagesAll, payload.stats.messagesAll);
-assert('the fixture is big enough to be worth checking', payload.stats.messages > 1000);
-assert('compactionTurns is 0 after the turn fix, as it must be', payload.stats.compactionTurns === 0);
+// ...and the precondition that makes it a check rather than an equality with itself. Without this
+// the assertion above is satisfied by any page that re-scopes the whole figure onto the view, and
+// that is the whole rule.
+assert('the conversation and this view are different sizes, so the two cannot be swapped',
+  payload.stats.messagesAll > payload.stats.messages);
+// The preconditions of section 3, asserted rather than assumed. A generator edited down to a
+// tenth of its size would leave every assertion below it comparing two near-identical small
+// numbers — still green, and no longer evidence of anything.
+assert('the synthetic session is big enough to be worth checking', payload.stats.messages > 1000);
 
 // A narrower range must produce strictly fewer messages, or the filter is not filtering.
 const halfEnd = Math.floor((mins + maxs) / 2);
@@ -324,10 +542,83 @@ check('half-range duration == span of the rows kept',
 const START = payload.session.startedAt;
 assert('the payload carries a session start', Number.isFinite(START) && START > 0);
 {
-  const wallFrom = new Date(2026, 9, 10, 23, 50, 0).getTime();
-  const wallTo = new Date(2026, 9, 11, 0, 20, 0).getTime();
-  const from = pure.parseRangeBound('2026-10-10T23:50', START);
-  const to = pure.parseRangeBound('2026-10-11T00:20', START);
+  /* The window is chosen from the payload, not written down.
+   *
+   * It used to be a literal -- 23:50 to 00:20 on fixed October dates -- which made this section a
+   * statement about the store rather than about the code. When that session was compacted away
+   * both sides of the equality below were 0, so it passed while comparing nothing; only the
+   * assertion after it noticed. A literal window is the one input here that silently stops being
+   * evidence, and nothing about the code can tell you that.
+   *
+   * What stays literal is the part that makes it worth running: the window crosses a LOCAL
+   * midnight, so converting each bound really is a subtraction the machine's distance from
+   * Greenwich gets to corrupt. */
+  const pad2n = (n) => (n < 10 ? '0' + n : String(n));
+  const dayKey = (ts) => {
+    const d = new Date(ts);
+    return d.getFullYear() + '-' + pad2n(d.getMonth() + 1) + '-' + pad2n(d.getDate());
+  };
+  const wallClock = (ts) => {
+    const d = new Date(ts);
+    return dayKey(ts) + ' ' + pad2n(d.getHours()) + ':' + pad2n(d.getMinutes()) + ':' + pad2n(d.getSeconds());
+  };
+  const stamped = scoped.state.flat
+    .map((e) => e.record.timestamp)
+    .filter((ts) => Number.isFinite(ts))
+    .sort((a, b) => a - b);
+
+  const PAD = 5 * 60000;
+  const wholeMinute = (ms, dir) => (dir < 0 ? Math.floor(ms / 60000) * 60000 : Math.ceil(ms / 60000) * 60000);
+  const span = stamped.length ? stamped[stamped.length - 1] - stamped[0] : 0;
+  let chosen = null;
+  let cursor = stamped.length ? new Date(stamped[0]) : null;
+  if (cursor) {
+    cursor.setHours(0, 0, 0, 0);
+    if (cursor.getTime() < stamped[0]) cursor.setDate(cursor.getDate() + 1);
+    for (let guard = 0; cursor.getTime() <= stamped[stamped.length - 1] && guard < 400; guard += 1) {
+      const midnight = cursor.getTime();
+      // Reached from the rows themselves rather than from a fixed number of minutes: the reader
+      // steps away, and on this session the last record before the one usable midnight was 41
+      // minutes early. A window of ±10 minutes would have found nothing and reported the store's
+      // habits as a fault in the arithmetic. Both ends have to exist, and the two ends together
+      // have to stay a small slice, or it is not a window.
+      let beforeAt = -1;
+      let afterAt = -1;
+      for (let i = 0; i < stamped.length; i += 1) {
+        if (stamped[i] < midnight) beforeAt = stamped[i];
+        else {
+          afterAt = stamped[i];
+          break;
+        }
+      }
+      const lo = beforeAt < 0 ? NaN : wholeMinute(beforeAt - PAD, -1);
+      const hi = afterAt < 0 ? NaN : wholeMinute(afterAt + PAD, 1);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi - lo <= span / 4) {
+        chosen = { wallFrom: lo, wallTo: hi };
+        break;
+      }
+      cursor = new Date(cursor.getTime());
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+  if (!chosen) {
+    // Failing by name beats carrying on: everything below reads `chosen`, and a guard that
+    // limps past its own precondition reports the arithmetic's faults for the store's.
+    console.log('[3b] no local midnight inside this session has rows on both sides of it');
+    console.log('FAILED_NAMES\t'
+      + JSON.stringify(['the session spans a local midnight with rows on both sides of it']));
+    process.exit(1);
+  }
+  const wallFrom = chosen.wallFrom;
+  const wallTo = chosen.wallTo;
+  assert('the window crosses a local midnight', dayKey(wallFrom) !== dayKey(wallTo));
+
+  // Typed into the pickers as the control actually sends them, so the strings under test are the
+  // ones the page reads rather than ones written to match the arithmetic.
+  const fromText = pure.formatRangeInput(wallFrom);
+  const toText = pure.formatRangeInput(wallTo);
+  const from = pure.parseRangeBound(fromText, START);
+  const to = pure.parseRangeBound(toText, START);
   check('a pair of bounds across midnight converts to the window it names',
     [from, to], [wallFrom - START, wallTo - START]);
 
@@ -341,13 +632,13 @@ assert('the payload carries a session start', Number.isFinite(START) && START > 
 
   scoped.state.rangeFrom = from;
   scoped.state.rangeTo = to;
-  scoped.state.rangeFromText = '2026-10-10T23:50';
-  scoped.state.rangeToText = '2026-10-11T00:20';
+  scoped.state.rangeFromText = fromText;
+  scoped.state.rangeToText = toText;
   const stats = scoped.scopedStats();
   check('the KPI over a date range equals the distinct ids of those rows',
     stats.messages, new Set(byClock.map((e) => e.record.id)).size);
   check('and the page-level label reads back as the wall clock it was typed as',
-    scoped.timeRangeLabel(), '2026-10-10 23:50:00 – 2026-10-11 00:20:00');
+    scoped.timeRangeLabel(), wallClock(wallFrom) + ' – ' + wallClock(wallTo));
 
   // And the same window, typed into the pickers as what the control actually sends.
   check('the control round trips back to the same offsets',
@@ -498,9 +789,16 @@ assert('the range opens unset', /rangeFrom: null,\s*\n\s*rangeTo: null,/.test(st
 // two-line regex failed on that instead of on anything wrong — it had frozen the shape of the
 // function rather than what the function has to do. What matters is that both are cleared and
 // that the query goes before the range, so the ledger never re-renders once with neither.
+// The reset then moved into `resetBaseFilters`, and the same mistake repeated one indirection
+// later: the lines were read out of `clearFilters`, which no longer has them, so the assertion
+// went red on a code change that broke nothing. Naming the function that owns the rule fixes it;
+// dropping the hop would not have. Checked order alone would pass on a 清除筛选 that had stopped
+// calling the reset altogether, which is a filter the reader cannot see and cannot turn off.
 const clearSrc = fnSource('function clearFilters()');
-const queryAt = clearSrc.indexOf("state.query = '';");
-const rangeAt = clearSrc.indexOf('clearTimeRange();');
+assert('清除筛选 runs the base reset', /resetBaseFilters\(\);/.test(clearSrc));
+const resetSrc = fnSource('function resetBaseFilters()');
+const queryAt = resetSrc.indexOf("state.query = '';");
+const rangeAt = resetSrc.indexOf('clearTimeRange();');
 assert('清除筛选 also drops the range', queryAt >= 0 && rangeAt > queryAt);
 
 // A picker the page could not read must not reach the filter. `NaN` fails the `isCount` test
@@ -512,7 +810,7 @@ assert('an unreadable box is not assigned',
 
 /* ---------- report ---------- */
 console.log('[1] parse / format / compare: ' + pass + ' assertions, ' + failures.length + ' failed');
-console.log('    fixture: ' + payload.stats.messages + ' messages, ' + scoped.state.flat.length + ' records, '
+console.log('    session: ' + payload.stats.messages + ' messages, ' + scoped.state.flat.length + ' records, '
   + payload.turns.length + ' turns, span ' + maxs + ' ms');
 // Machine-readable, so the mutation runner can require the *named* guard to fire instead of
 // matching on a substring that any nearby assertion can satisfy by accident. Assertion names
