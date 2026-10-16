@@ -1,6 +1,8 @@
 import path from 'node:path';
 
 import {
+  AGENT_ACCESS_CAPABILITIES,
+  AGENT_CONCURRENCY_MAX,
   ARTIFACT_FIELDS,
   CONNECTOR_PROVIDER,
   ENTRY_EXTENSION,
@@ -10,8 +12,13 @@ import {
   MCP_SERVER_NAME,
   MINIAPP_FIELDS,
   PAYLOAD_DIRECTORY,
+  RESERVED_ROUTE_PREFIX,
   RUNTIME_FIELDS,
   SURFACE_FIELDS,
+  SURFACE_WINDOW_BOOLEAN_FIELDS,
+  SURFACE_WINDOW_DIMENSION_FIELDS,
+  SURFACE_WINDOW_DIMENSION_MAX,
+  SURFACE_WINDOW_DIMENSION_MIN,
 } from '../contract.mjs';
 import { isRecord, pathExists } from '../fs.mjs';
 import { isCoveredBy, normalizePluginPath, normalizeRoutePath } from '../paths.mjs';
@@ -19,7 +26,7 @@ import { isCoveredBy, normalizePluginPath, normalizeRoutePath } from '../paths.m
 const FILE = 'miniapp/miniapp.json';
 
 export async function checkMiniApp(report, { packageDir, manifest }) {
-  const resolved = { nodeRoots: [], clientRoots: [] };
+  const resolved = { nodeRoots: [], clientRoots: [], features: [] };
   if (!isRecord(manifest)) {
     report.error('MINIAPP_NOT_OBJECT', 'miniapp.json must be a JSON object', FILE);
     return resolved;
@@ -37,6 +44,11 @@ export async function checkMiniApp(report, { packageDir, manifest }) {
   checkSurface(report, manifest.surface);
   checkMcpEndpoints(report, manifest.mcpEndpoints);
   checkHostConnectorAccess(report, manifest.hostConnectorAccess);
+  checkAgentAccess(report, manifest.agentAccess);
+  checkAgentConcurrency(report, manifest.agentConcurrency);
+  if (manifest.agentAccess !== undefined) resolved.features.push('agentAccess');
+  if (manifest.agentConcurrency !== undefined) resolved.features.push('agentConcurrency');
+  if (isRecord(manifest.surface) && manifest.surface.window !== undefined) resolved.features.push('surface.window');
   return resolved;
 }
 
@@ -113,11 +125,54 @@ async function checkRuntime(report, packageDir, value, nodeRoots) {
 
 function checkSurface(report, value) {
   if (!isRecord(value) || Object.keys(value).some((k) => !SURFACE_FIELDS.has(k))) {
-    report.error('MINIAPP_SURFACE_INVALID', 'surface must be an object with only "path"', FILE);
+    report.error('MINIAPP_SURFACE_INVALID', 'surface must be an object with only "path" and "window"', FILE);
     return;
   }
   const route = normalizeRoutePath(value.path);
   if (!route.ok) report.error('MINIAPP_SURFACE_INVALID', `surface.path ${route.reason}`, FILE);
+  else checkRouteNotReserved(report, route.value, 'surface.path');
+  if (value.window !== undefined) checkSurfaceWindow(report, value.window);
+}
+
+// Same rule set as the Host's validateMiniAppSurfaceWindow.
+function checkSurfaceWindow(report, value) {
+  if (!isRecord(value)) {
+    report.error('MINIAPP_SURFACE_INVALID', 'surface.window must be an object', FILE);
+    return;
+  }
+  const known = new Set([...SURFACE_WINDOW_DIMENSION_FIELDS, ...SURFACE_WINDOW_BOOLEAN_FIELDS]);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) report.error('MINIAPP_SURFACE_INVALID', `surface.window has unknown field "${key}"`, FILE);
+  }
+  const dimensions = {};
+  for (const key of SURFACE_WINDOW_DIMENSION_FIELDS) {
+    const entry = value[key];
+    if (entry === undefined) continue;
+    if (!Number.isInteger(entry) || entry < SURFACE_WINDOW_DIMENSION_MIN || entry > SURFACE_WINDOW_DIMENSION_MAX) {
+      report.error('MINIAPP_SURFACE_INVALID', `surface.window.${key} must be an integer from ${SURFACE_WINDOW_DIMENSION_MIN} to ${SURFACE_WINDOW_DIMENSION_MAX}`, FILE);
+      continue;
+    }
+    dimensions[key] = entry;
+  }
+  for (const [minKey, key] of [['minWidth', 'width'], ['minHeight', 'height']]) {
+    if (dimensions[minKey] !== undefined && dimensions[key] !== undefined && dimensions[minKey] > dimensions[key]) {
+      report.error('MINIAPP_SURFACE_INVALID', `surface.window.${minKey} must not exceed surface.window.${key}`, FILE);
+    }
+  }
+  for (const key of SURFACE_WINDOW_BOOLEAN_FIELDS) {
+    if (value[key] !== undefined && typeof value[key] !== 'boolean') {
+      report.error('MINIAPP_SURFACE_INVALID', `surface.window.${key} must be a boolean`, FILE);
+    }
+  }
+  if (value.transparent === true && value.frame !== false) {
+    report.error('MINIAPP_SURFACE_INVALID', 'surface.window.transparent requires surface.window.frame to be false', FILE);
+  }
+}
+
+function checkRouteNotReserved(report, route, label) {
+  if (route === RESERVED_ROUTE_PREFIX || route.startsWith(`${RESERVED_ROUTE_PREFIX}/`)) {
+    report.error('MINIAPP_ROUTE_RESERVED', `${label} "${route}" is under ${RESERVED_ROUTE_PREFIX}/, which the Host reserves`, FILE);
+  }
 }
 
 function checkMcpEndpoints(report, value) {
@@ -145,6 +200,7 @@ function checkMcpEndpoints(report, value) {
     if (servers.has(item.server) || paths.has(route.value)) {
       report.error('MINIAPP_MCP_ENDPOINT_INVALID', 'MCP endpoint server and path must each be unique', FILE);
     }
+    checkRouteNotReserved(report, route.value, 'MCP endpoint path');
     servers.add(item.server);
     paths.add(route.value);
   }
@@ -158,4 +214,18 @@ function checkHostConnectorAccess(report, value) {
     return;
   }
   report.warning('HOST_CONNECTOR_UNVERIFIED', 'declared providers are granted by the Host at install time and are not checked here', FILE);
+}
+
+function checkAgentAccess(report, value) {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.some((capability) => !AGENT_ACCESS_CAPABILITIES.has(capability))) {
+    report.error('MINIAPP_AGENT_ACCESS_INVALID', `agentAccess must be an array containing only ${[...AGENT_ACCESS_CAPABILITIES].map((c) => `"${c}"`).join(', ')}`, FILE);
+  }
+}
+
+function checkAgentConcurrency(report, value) {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || value < 1 || value > AGENT_CONCURRENCY_MAX) {
+    report.error('MINIAPP_AGENT_CONCURRENCY_INVALID', `agentConcurrency must be an integer from 1 to ${AGENT_CONCURRENCY_MAX}`, FILE);
+  }
 }

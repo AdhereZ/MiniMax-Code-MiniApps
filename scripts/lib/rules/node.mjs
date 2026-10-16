@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { START_EXPORT, STDOUT_CALL } from '../contract.mjs';
+import { RESERVED_ROUTE_LITERAL, START_EXPORT, STDOUT_CALL, UNGUARDED_SERVER } from '../contract.mjs';
 import { pathExists } from '../fs.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +41,12 @@ export async function checkNode(report, { packageDir, entry, nodeRoots }) {
     }
     if (isEntry && !START_EXPORT.test(source)) {
       report.error('ENTRY_START_EXPORT_MISSING', 'the Node entry must export a named start function using ESM syntax', relativePath);
+    }
+    if (UNGUARDED_SERVER.test(source)) {
+      report.warning('NODE_UNGUARDED_SERVER', "creates an https, http2, net, or tls server; the Host's loopback guard covers only node:http, so context.listen.port must be served by node:http or the Mini App never becomes ready", relativePath);
+    }
+    if (RESERVED_ROUTE_LITERAL.test(source)) {
+      report.warning('NODE_RESERVED_ROUTE', 'mentions a /__mavis/ route; the Host reserves that prefix and plugin routes under it do not work', relativePath);
     }
   }
 }

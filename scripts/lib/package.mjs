@@ -17,8 +17,10 @@ export async function validatePackage(packageDir, { requireLowercaseAuthor = tru
   await checkLayout(report, { packageDir: dir, requireLowercaseAuthor });
 
   const manifest = await readJson(report, dir, '.minimax-plugin/plugin.json', 'MANIFEST_UNREADABLE');
+  const features = [];
   if (manifest.present) {
     const identity = await checkManifest(report, { packageDir: dir, manifest: manifest.value });
+    features.push(...(identity.features ?? []));
     await checkNameMatchesDirectory(report, { packageDir: dir, name: identity.name });
     if (identity.icon) await checkImageFile(report, { packageDir: dir, relativePath: identity.icon, label: 'icon' });
     if (identity.darkIcon) await checkImageFile(report, { packageDir: dir, relativePath: identity.darkIcon, label: 'darkIcon' });
@@ -28,11 +30,12 @@ export async function validatePackage(packageDir, { requireLowercaseAuthor = tru
   if (packageJson.present) checkMcode(report, { packageJson: packageJson.value });
 
   const miniapp = await readJson(report, dir, 'miniapp/miniapp.json', 'MINIAPP_UNREADABLE');
-  let resolved = { nodeRoots: [], clientRoots: [] };
+  let resolved = { nodeRoots: [], clientRoots: [], features: [] };
   if (miniapp.present) resolved = await checkMiniApp(report, { packageDir: dir, manifest: miniapp.value });
+  features.push(...resolved.features);
 
   await checkFiles(report, { packageDir: dir });
-  await checkReadme(report, { packageDir: dir });
+  await checkReadme(report, { packageDir: dir, features });
   await checkNode(report, { packageDir: dir, entry: resolved.entry, nodeRoots: resolved.nodeRoots });
 
   return report.diagnostics;

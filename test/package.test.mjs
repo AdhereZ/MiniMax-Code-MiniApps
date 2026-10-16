@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readPackageName, validatePackage } from '../scripts/lib/package.mjs';
 import { hasErrors } from '../scripts/lib/report.mjs';
-import { codes, copyExample, makeTmpRoot } from './helpers.mjs';
+import { codes, copyExample, editJson, makeTmpRoot } from './helpers.mjs';
 
 test('package: the example is a clean baseline', async () => {
   const root = await makeTmpRoot();
@@ -50,4 +50,19 @@ test('package: an example is not subject to the lowercase-author rule', async ()
   const root = await makeTmpRoot();
   const { dir } = await copyExample(root, { author: 'Examples' });
   assert.deepEqual(await validatePackage(dir, { requireLowercaseAuthor: false }), []);
+});
+
+test('package: features from plugin.json and miniapp.json reach the README minimum-version check', async () => {
+  const root = await makeTmpRoot();
+  const { dir } = await copyExample(root);
+  await editJson(path.join(dir, 'miniapp', 'miniapp.json'), (m) => ({ ...m, agentAccess: ['session.run'] }));
+  await editJson(path.join(dir, '.minimax-plugin', 'plugin.json'), (m) => ({ ...m, agents: ['agents/helper.md'] }));
+  await mkdir(path.join(dir, 'agents'));
+  await writeFile(path.join(dir, 'agents', 'helper.md'), '# helper\n');
+  const diagnostics = await validatePackage(dir);
+  assert.deepEqual(codes(diagnostics), ['README_MIN_VERSION_MISSING']);
+  assert.match(diagnostics[0].message, /agents, agentAccess/u);
+  const readme = path.join(dir, 'README.md');
+  await writeFile(readme, (await readFile(readme, 'utf8')).replace('MiniMax Code 3.0.73', 'MiniMax Code 3.1.2'));
+  assert.deepEqual(await validatePackage(dir), []);
 });

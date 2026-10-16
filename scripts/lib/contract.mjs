@@ -1,6 +1,15 @@
 // Constants shared by every rule. Values mirror the MiniMax Code package reader.
 
-export const HOST_VERSION = '3.0.73';
+export const HOST_VERSION = '3.1.2';
+
+// Clients older than the listed version reject the whole package when it declares the feature.
+// Keys are the names diagnostics and docs use for each feature.
+export const FEATURE_MIN_HOST_VERSION = Object.freeze({
+  agents: '3.1.2',
+  agentAccess: '3.1.2',
+  agentConcurrency: '3.1.2',
+  'surface.window': '3.1.2',
+});
 
 export const MANIFEST_FIELDS = new Set([
   '$schema',
@@ -19,6 +28,7 @@ export const MANIFEST_FIELDS = new Set([
   'skills',
   'hooks',
   'hostBindings',
+  'agents',
 ]);
 
 export const PLUGIN_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
@@ -35,6 +45,7 @@ export const MCP_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.mcp\.json$/u;
 export const SKILL_PATH = /^skills\/[A-Za-z0-9._-]+\/SKILL\.md$/u;
 export const HOOK_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.json$/u;
 export const HOST_BINDING_PATH = /^bindings\/[A-Za-z0-9._-]+\.binding\.json$/u;
+export const AGENT_PATH = /^agents\/[a-z][a-z0-9_-]*\.md$/u;
 
 export const CATEGORIES = [
   'Office',
@@ -61,10 +72,20 @@ export const MINIAPP_FIELDS = new Set([
   'surface',
   'mcpEndpoints',
   'hostConnectorAccess',
+  'agentAccess',
+  'agentConcurrency',
 ]);
 export const ARTIFACT_FIELDS = new Set(['client', 'node']);
 export const RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
-export const SURFACE_FIELDS = new Set(['path']);
+export const SURFACE_FIELDS = new Set(['path', 'window']);
+export const SURFACE_WINDOW_DIMENSION_FIELDS = ['width', 'height', 'minWidth', 'minHeight'];
+export const SURFACE_WINDOW_BOOLEAN_FIELDS = ['resizable', 'frame', 'transparent', 'alwaysOnTop', 'skipTaskbar', 'clickThrough'];
+export const SURFACE_WINDOW_DIMENSION_MIN = 200;
+export const SURFACE_WINDOW_DIMENSION_MAX = 10_000;
+export const AGENT_ACCESS_CAPABILITIES = new Set(['session.run']);
+export const AGENT_CONCURRENCY_MAX = 32;
+// The Host answers requests under this prefix itself; plugin routes there never work.
+export const RESERVED_ROUTE_PREFIX = '/__mavis';
 export const MCP_ENDPOINT_FIELDS = new Set(['server', 'path']);
 export const HOST_CONNECTOR_ACCESS_FIELDS = new Set(['providers']);
 export const MCP_SERVER_NAME = /^[a-zA-Z0-9_-]{1,128}$/u;
@@ -105,3 +126,14 @@ export const README_HEADINGS = ['## Tested environment', '## Data & access'];
 export const STDOUT_CALL = /\b(?:console\.(?:log|info|debug|dir|table)|process\.stdout\.write)\s*\(/u;
 export const START_EXPORT =
   /^\s*export\s+(?:async\s+function\s+start\b|function\s+start\b|const\s+start\b|let\s+start\b|\{[^}]*\bstart\b[^}]*\})/mu;
+// The Host's loopback guard patches node:http only; servers from these modules never pass readiness.
+const UNGUARDED_MODULE = String.raw`['"](?:node:)?(?:https|http2|net|tls)['"]`;
+export const UNGUARDED_SERVER = new RegExp(
+  [
+    String.raw`\b(?:https|http2|net|tls)\s*\.\s*create(?:Secure)?Server\s*\(`,
+    String.raw`\bimport\s*\{[^}]*\bcreate(?:Secure)?Server\b[^}]*\}\s*from\s*${UNGUARDED_MODULE}`,
+    String.raw`\{[^}]*\bcreate(?:Secure)?Server\b[^}]*\}\s*=\s*require\(\s*${UNGUARDED_MODULE}\s*\)`,
+  ].join('|'),
+  'u',
+);
+export const RESERVED_ROUTE_LITERAL = /\/__mavis(?:\/|['"`])/u;

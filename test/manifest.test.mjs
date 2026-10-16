@@ -21,7 +21,7 @@ async function run(mutate, prepare) {
 test('manifest: baseline passes and returns identity', async () => {
   const { report, identity } = await run((m) => m);
   assert.deepEqual(report.diagnostics, []);
-  assert.deepEqual(identity, { name: 'hello-miniapp', icon: 'icon.png' });
+  assert.deepEqual(identity, { name: 'hello-miniapp', icon: 'icon.png', features: [] });
 });
 
 test('manifest: $schema is an accepted optional string', async () => {
@@ -80,6 +80,29 @@ test('manifest: skills, mcpServers, hooks, hostBindings need matching pattern an
   assert.deepEqual(codes(badPattern.report.diagnostics), ['MANIFEST_REFERENCE_INVALID']);
   const duplicate = await run((m) => ({ ...m, hooks: ['hooks/a.json', 'hooks/a.json'] }));
   assert.deepEqual(codes(duplicate.report.diagnostics), ['MANIFEST_REFERENCE_INVALID']);
+});
+
+test('manifest: agents are agents/<name>.md files that exist, and report the feature', async () => {
+  const present = await run(
+    (m) => ({ ...m, agents: ['agents/route-planner.md'] }),
+    async (dir) => {
+      await mkdir(path.join(dir, 'agents'), { recursive: true });
+      await writeFile(path.join(dir, 'agents', 'route-planner.md'), '# route planner\n');
+    },
+  );
+  assert.deepEqual(present.report.diagnostics, []);
+  assert.deepEqual(present.identity.features, ['agents']);
+  const missing = await run((m) => ({ ...m, agents: ['agents/route-planner.md'] }));
+  assert.deepEqual(codes(missing.report.diagnostics), ['MANIFEST_REFERENCE_MISSING']);
+  for (const entry of ['agents/Planner.md', 'agents/nested/planner.md', 'planner.md', 'agents/planner.txt']) {
+    const bad = await run((m) => ({ ...m, agents: [entry] }));
+    assert.deepEqual(codes(bad.report.diagnostics), ['MANIFEST_REFERENCE_INVALID'], entry);
+  }
+});
+
+test('manifest: hostCapabilities cannot be claimed by a manifest', async () => {
+  const { report } = await run((m) => ({ ...m, hostCapabilities: [{ id: 'browser', version: 1 }] }));
+  assert.deepEqual(codes(report.diagnostics), ['MANIFEST_UNKNOWN_FIELD']);
 });
 
 test('manifest: non-object is a single error', async () => {
