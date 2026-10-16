@@ -1069,6 +1069,14 @@ input[type='range'] {
   color: var(--cqv-pending);
 }
 
+.confirm-bar[data-mode='continuous'] .confirm-text strong {
+  color: var(--mcode-accent);
+}
+
+.confirm-actions .btn[hidden] {
+  display: none;
+}
+
 .confirm-actions {
   display: flex;
   gap: 4px;
@@ -1186,6 +1194,11 @@ input[type='range'] {
 }
 
 /* ---------------------------------------------------------------- responsive */
+/* While picking, the annotation panel stays clear of the pick bar so both can be used together. */
+body.picking .float-panel.right {
+  max-height: calc(100vh - 12px - 140px);
+}
+
 @media (max-width: 900px) {
   .segmented[aria-label='视角'] button[data-view='back'],
   .segmented[aria-label='视角'] button[data-view='left'],
@@ -1200,6 +1213,10 @@ input[type='range'] {
     bottom: 72px;
     width: calc(100vw - 24px);
     max-height: 50vh;
+  }
+  body.picking .float-panel.right {
+    bottom: 128px;
+    max-height: calc(50vh - 56px);
   }
 }
 

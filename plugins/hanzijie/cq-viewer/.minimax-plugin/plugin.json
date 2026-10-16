@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "cq-viewer",
   "displayName": "CadQuery Viewer",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "本地 3D 模型查看器：浏览项目文件夹里的 STL / STEP（保留装配零件名称、颜色和真实边线），接收 CadQuery 脚本推送的模型，在模型上标注位置并一键发给 AI。AI 可以通过 MCP 工具登记模型文件夹、在查看器里打开模型；内置 flowful-ai 的 CadQuery 参数化建模 skill。",
   "author": "HanZijie, flowful-ai",
   "icon": "icon.png",
