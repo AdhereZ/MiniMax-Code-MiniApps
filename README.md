@@ -14,9 +14,9 @@ Packages are organized by author under `plugins/<github-username>/<plugin-id>/`.
 
 ## Pursuing Human in the Loop, Toward Agent OS
 
-**Delivery between AI and knowledge workers should not be one-shot.** Code delivery between a coding agent and a programmer is not completed in one pass. Yet many AI products try to deliver a lawyer's, analyst's, or operator's work as a single final answer. Serious work moves from draft to final through human–AI collaboration and repeated refinement; that loop is still too fragmented. Human–AI collaboration is still at a very early stage.
+We believe the Agent is evolving into the next-generation operating system (OS). In this paradigm shift, plugins are no longer mere feature extensions: plugins are software, and plugins are apps (MiniApps).
 
-Programmers write in an IDE; lawyers, analysts, and operators write in their own professional environments. Real work, like software development, advances continuously and gets refined until it is stable and ready to deliver. An AI that writes once and walks away is irresponsible in serious work, because **the goal is not text generation, but delivery.**
+At the same time, real productivity in every industry remains rooted in highly specialized work environments. A conversational interface (Chat UI) alone cannot replace the precise control and rich views of professional tools. Professional workflows of the future should not ask users to leave their workbench to accommodate AI. Instead, professional environments and AI should evolve in deep symbiosis, with AI internalized as a foundational, atomic capability available on demand—like power and water, compute, and storage. By building professional-grade MiniApps that grow on top of the Agent OS, we aim to connect the specialized interfaces of vertical domains with the AI-native compute beneath them, and to reshape how every industry works.
 
 > *Self-drive Route Planner case: an Agent-assisted weekend trip around Shanghai, with the final itinerary and synchronized route workspace visible together.* This case shows the kind of professional workspace a MiniApp can provide: the Agent conversation and complete itinerary are on the left, while the route summary, interactive map, and editable trip workspace are on the right.
 
@@ -41,8 +41,6 @@ We want users to be able to:
 In the way of working we envision, a lawyer would not submit an AI-written pleading directly to a court; an analyst would not make an investment decision directly from an AI-generated opinion; and an operator would not launch an AI-generated campaign unchanged.
 
 Instead, they would ask AI to research background, organize material, prepare a first draft, improve the expression, and find omissions—then return to their professional workspace to **review, edit, confirm, and let AI continue.**
-
-MiniApps enforce this boundary in the product: when content from a MiniApp page is handed to the Agent, it first enters the user's input box. The user can edit and confirm it before sending. AI never presses the Send button on the user's behalf.
 
 ## Architecture
 
