@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "mcpServers": {
+    "momo": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9/mcp/momo",
+      "headers": {},
+      "description": "MoMo 协作工具：想法、记录、三项门槛、任务看板。普通会话里也能把结论交给 MoMo。",
+      "timeout": 60000
+    }
+  }
+}
