@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>协作 · MoMo</title>
+    <link rel="stylesheet" href="/collab/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <button class="brand" id="avatar-button" type="button" aria-label="更换 MoMo 形象">
+        <span class="momo" data-size="24"></span>
+        <span class="brand-text"><strong>协作</strong><span class="subtle">项目管家 MoMo</span></span>
+      </button>
+      <nav class="tabs" role="tablist" aria-label="视图" id="nav"></nav>
+      <div class="topbar-actions">
+        <button type="button" class="icon-button" id="popout" aria-label="弹出为独立窗口" title="弹出为独立窗口">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2h5v5M14 2 8 8M12 9v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="banner" role="alert" hidden></div>
+
+    <main id="main" class="layout">
+      <section class="pane pane-chat" id="pane-chat" aria-label="和 MoMo 的对话">
+        <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        <form class="composer" id="composer">
+          <div class="composer-context" id="composer-context" hidden></div>
+          <div class="attachments" id="attachments"></div>
+          <div class="composer-box">
+            <textarea id="input" rows="1" placeholder="跟 MoMo 说说你的想法，贴图或链接都行" aria-label="消息"></textarea>
+            <div class="composer-row">
+              <label class="icon-button" title="添加图片">
+                <input type="file" accept="image/png,image/jpeg,image/gif,image/webp" id="file-input" multiple hidden />
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                <span class="sr-only">添加图片</span>
+              </label>
+              <span class="hint" id="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+              <button type="button" class="secondary small" id="stop" hidden>停止</button>
+              <button type="submit" class="primary small" id="send">发送</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <section class="pane pane-side" id="pane-side" aria-label="任务和想法"></section>
+    </main>
+
+    <aside class="drawer" id="drawer" aria-label="详情" hidden>
+      <div class="drawer-scrim" data-action="close-drawer"></div>
+      <div class="drawer-panel" role="dialog" aria-modal="false" aria-labelledby="drawer-title">
+        <div class="drawer-head">
+          <button type="button" class="icon-button" data-action="close-drawer" aria-label="关闭详情">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </button>
+          <h2 id="drawer-title"></h2>
+        </div>
+        <div class="drawer-body" id="drawer-body"></div>
+      </div>
+    </aside>
+
+    <dialog id="modal"></dialog>
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script type="module" src="/collab/app.js"></script>
+  </body>
+</html>

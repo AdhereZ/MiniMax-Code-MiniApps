@@ -1,0 +1,10 @@
+{
+  "name": "momo-collab",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "mcode": {
+    "schemaVersion": 2,
+    "miniApp": "./miniapp/miniapp.json"
+  }
+}

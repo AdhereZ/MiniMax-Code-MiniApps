@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "name": "momo-collab",
+  "displayName": "协作 · MoMo",
+  "version": "0.2.0",
+  "description": "项目管家 MoMo：把随手冒出的想法攒起来、理清楚，写成任务后替你安排会话去执行，交接背景、跟进进度、收回结果；任务进展在看板上一眼可见。",
+  "author": "amszuidas",
+  "icon": "icon.png",
+  "category": "Productivity",
+  "exampleQueries": [
+    "打开协作，把我最近在想的一件事交给 MoMo",
+    "MoMo，现在进展到哪了？哪些事需要我处理？",
+    "把这个会话里聊出的结论交给 MoMo，归到对应的想法"
+  ],
+  "apps": [],
+  "mcpServers": [
+    "servers.mcp.json"
+  ],
+  "skills": [
+    "skills/momo-collab/SKILL.md"
+  ]
+}
