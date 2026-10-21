@@ -229,6 +229,112 @@ test('reactions stay on the final bubble while message parts change, preserving 
   assert.equal(document.activeElement, document.querySelector('.reaction-trigger'));
 });
 
+test('a long reply folds its earlier bubbles away and keeps the newest three in the open', async () => {
+  const parts = [];
+  for (let index = 0; index < 12; index += 1) {
+    parts.push({ type: 'text', text: `Step ${index}` }, { type: 'tool', name: 'read', state: 'done' });
+  }
+  parts.push({ type: 'text', text: 'The answer' });
+  const item = message('m-long-reply', 'The answer', { parts, userReactions: ['👍'], reactionsRevision: 1 });
+  await reset([item]);
+  // The earlier bubbles keep their own shape; they move into the folded area.
+  const fold = document.querySelector('.bubble-fold');
+  assert.ok(fold, 'a reply with many parts must fold its earlier bubbles');
+  assert.equal(fold.open, false, 'the fold starts closed');
+  assert.match(fold.querySelector('.bubble-fold-closed').textContent, /10/);
+  assert.equal(fold.querySelectorAll('.bubble').length, 10);
+  // The newest three stay in the open, the answer last, with the reaction indicator on it.
+  const wrap = document.querySelector('article.msg .bubble-wrap');
+  const open = [...wrap.children].filter((child) => child.classList.contains('bubble'));
+  assert.equal(open.length, 3);
+  assert.match(open[0].textContent, /Step 10/);
+  assert.match(open[1].textContent, /Step 11/);
+  assert.match(open[2].textContent, /The answer/);
+  assert.equal(open[2].querySelector('.reaction-chip').dataset.emoji, '👍');
+  // Opening the fold shows the same bubbles again; the reply around it does not move.
+  fold.open = true;
+  assert.equal(fold.querySelectorAll('.bubble').length, 10);
+  assert.equal(wrap.querySelectorAll('.bubble').length, 13);
+});
+
+test('a folded reply tells on hover what every bubble said, a short one stays as it was', async () => {
+  const parts = [];
+  for (let index = 0; index < 6; index += 1) parts.push({ type: 'text', text: `Step ${index}` });
+  await reset([message('m-hint-reply', 'Step 5', { parts })]);
+  // A title is the official way of telling more on hover: the task rows and the
+  // attachments use it too.
+  const fold = document.querySelector('.bubble-fold');
+  assert.ok(fold, 'six text parts must fold');
+  assert.equal(fold.querySelectorAll('.bubble').length, 3);
+  assert.equal(fold.querySelector('.bubble').title, 'Step 0');
+  assert.match(fold.querySelector('.bubble-fold-summary').title, /3/);
+  const open = [...document.querySelectorAll('article.msg .bubble-wrap > .bubble')];
+  assert.equal(open.length, 3);
+  assert.equal(open[0].title, 'Step 3');
+  // A short reply keeps the official markup: no title added to its bubbles.
+  await reset([message('m-no-hint', 'Second', { parts: [{ type: 'text', text: 'First' }, { type: 'text', text: 'Second' }] })]);
+  assert.equal(document.querySelector('.bubble-fold'), null);
+  assert.equal(document.querySelector('article.msg .bubble-wrap > .bubble').title, '');
+});
+
+test('a short reply keeps its bubbles in the open, without a fold', async () => {
+  const item = message('m-short-reply', 'Second', {
+    parts: [{ type: 'text', text: 'First' }, { type: 'text', text: 'Second' }],
+  });
+  await reset([item]);
+  assert.equal(document.querySelector('.bubble-fold'), null);
+  assert.equal(document.querySelectorAll('article.msg .bubble').length, 2);
+});
+
+test('the folded area keeps a fixed height and scrolls inside itself', async () => {
+  const css = await readFile(new URL('../miniapp/client/app.css', import.meta.url), 'utf8');
+  const rule = css.match(/\n\.bubble-fold-body \{[^}]*\}/)?.[0] ?? '';
+  assert.ok(rule, 'the folded area needs a rule of its own');
+  // The point of the fold: the bubbles inside it scroll, the feed around it does not grow.
+  assert.match(rule, /max-height: min\(320px, 40vh\)/);
+  assert.match(rule, /overflow-y: auto/);
+});
+
+test('a multi-line reply keeps its actions below the text and its reaction indicator above them', async () => {
+  const text = 'First line\nSecond line\n\nThird paragraph\nFourth line';
+  const item = message('m-multiline', text, {
+    parts: [{ type: 'text', text }],
+    userReactions: ['👍'], reactionsRevision: 1,
+  });
+  await reset([item]);
+  const wrap = document.querySelector('article.msg .bubble-wrap');
+  const bubble = wrap.querySelector('.bubble');
+  const tools = wrap.querySelector('.msg-tools');
+  // The action row is a sibling below the bubble, never a child of it: a reply that runs
+  // over several lines must not push the buttons back to the top of the message.
+  assert.equal(bubble.querySelector('.msg-tools'), null);
+  assert.equal(tools.parentElement, wrap);
+  assert.equal(wrap.lastElementChild, tools);
+  assert.deepEqual([...wrap.children].map((child) => child.className), ['bubble', 'msg-tools']);
+  // Every line of the reply belongs to that one bubble.
+  assert.match(bubble.textContent, /First line/);
+  assert.match(bubble.textContent, /Fourth line/);
+  // The reaction indicator stays with the bubble it belongs to, so it renders above the row.
+  assert.equal(bubble.querySelector('.reaction-chip').dataset.emoji, '👍');
+  // The quote action still carries the whole reply, however many lines it has.
+  tools.querySelector('[aria-label="Quote"]').click();
+  await settle();
+  assert.match(document.querySelector('.quoting').textContent, /First line/);
+});
+
+test('the reaction indicator is painted from the theme instead of a fixed brand colour', async () => {
+  const css = await readFile(new URL('../miniapp/client/app.css', import.meta.url), 'utf8');
+  const rule = css.match(/\n\.reaction-bar \{[^}]*\}/)?.[0] ?? '';
+  assert.ok(rule, 'the reaction indicator needs a rule of its own');
+  // The indicator sits on the bubble, so it follows the app's tag language: a themed
+  // surface, a hairline border and muted ink. Both themes then read the same way.
+  assert.match(rule, /background: var\(--tag\)/);
+  assert.match(rule, /border: 1px solid var\(--line-strong\)/);
+  assert.match(rule, /color: var\(--muted\)/);
+  assert.doesNotMatch(rule, /var\(--accent\)/);
+  assert.doesNotMatch(css, /--reaction-ink/);
+});
+
 test('history paging prepends in order, retains scroll position and exports every page separately', async () => {
   await reset();
   // Several messages can share the same millisecond; page order remains authoritative.
@@ -636,4 +742,41 @@ test('group execution records keep each reply linked to its own session and part
     state.groups = [];
     await reset();
   }
+});
+
+test('the background task strip keeps the official one line rows and their stop button', async () => {
+  await reset();
+  // Nothing is running: the strip stays empty instead of printing a stray "null".
+  assert.equal(document.querySelector('.helpers').textContent, '');
+  const chat = 'bot:bot_a';
+  const queued = Array.from({ length: 5 }, (_, index) => ({
+    id: `hlp_q${index}`, botId: 'bot_a', chatId: chat, title: `Queued task ${index + 1}`, task: `Queued task ${index + 1}`,
+    status: 'queued', createdAt: Date.now(),
+  }));
+  emit({
+    type: 'helpers.changed',
+    helpers: [
+      { id: 'hlp_run', botId: 'bot_a', chatId: chat, title: 'Rebuild the truth table', task: 'Rebuild the truth table in the verifier', status: 'running', startedAt: Date.now() - 60000 },
+      { id: 'hlp_wait', botId: 'bot_b', chatId: chat, title: 'Collect the samples', task: 'Collect the samples', status: 'waiting_for_tasks', createdAt: Date.now() - 120000 },
+      ...queued,
+    ],
+  });
+  await settle();
+  const strip = document.querySelector('.helpers');
+  const rows = strip.querySelectorAll('.helper-row');
+  // Every job keeps a row of its own, in the order the Host sent them.
+  assert.equal(rows.length, 7);
+  // A row is one line: who is doing what, then the elapsed time, then the stop button.
+  const running = rows[0];
+  assert.equal(running.className, 'helper-row');
+  assert.match(running.querySelector('.helper-text').textContent, /Rob is working on "Rebuild the truth table"/);
+  assert.ok(running.querySelector('.helper-time').textContent);
+  assert.equal(running.querySelector('button').className, 'btn sm');
+  assert.equal(running.querySelector('button').textContent, 'Stop');
+  // The row carries the whole task as its hover hint.
+  assert.equal(running.title, 'Rebuild the truth table in the verifier');
+  // A queued job says so, and has no elapsed time yet.
+  const queuedRow = rows[2];
+  assert.match(queuedRow.querySelector('.helper-text').textContent, /Rob has this queued: "Queued task 1"/);
+  assert.equal(queuedRow.querySelector('.helper-time').textContent, '');
 });
