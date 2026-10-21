@@ -729,8 +729,8 @@ test('the background task strip keeps the official one line rows and folds a lon
   await settle();
   const strip = document.querySelector('.helpers');
   const rows = strip.querySelectorAll('.helper-row');
-  // The rows are the ones the official build draws, in its order. The first three stay in the
-  // open, the rest fold into one line.
+  // The rows are the ones the official build draws. The fold keeps three of them in the open,
+  // the ones that are already working first, and the rest fold into one line.
   assert.equal(rows.length, 3);
   // A row is one line: who is doing what, then the elapsed time, then the stop button.
   const running = rows[0];
@@ -763,8 +763,9 @@ test('the background task strip keeps the official one line rows and folds a lon
   assert.equal(strip.querySelector('.helper-more'), button, 'the redraw reuses the button node');
   assert.equal(document.activeElement, button, 'the redraw keeps the focus on it');
 
-  // A job that is already working is never the one that folds away, even when the queue in
-  // front of it is long.
+  // The rows are ordered by how far along the job is, and the fold keeps the first three: a job
+  // that is already working is never the one that folds away, even when the queue in front of
+  // it is long.
   button.click();
   await settle();
   emit({
@@ -773,8 +774,34 @@ test('the background task strip keeps the official one line rows and folds a lon
   });
   await settle();
   const visible = [...strip.querySelectorAll('.helper-row')].map((row) => row.textContent);
-  assert.ok(visible.some((text) => /Answer the ticket/.test(text)), 'a running task stays in the open');
+  assert.equal(visible.length, 3);
+  assert.match(visible[0], /Rebuild the truth table/, 'a running job comes first');
+  assert.match(visible[1], /Answer the ticket/, 'the running task comes next');
+  assert.match(visible[2], /Awaiting dependencies/, 'the waiting job comes after the running ones');
   assert.ok(!visible.some((text) => /Queued task/.test(text)), 'a queued job gives way to the running one');
+
+  // Two jobs and no fold: the strip still orders them by how far along they are, so a queued
+  // job never sits above a job that is already working.
+  emit({ type: 'tasks.changed', tasks: [] });
+  emit({ type: 'helpers.changed', helpers: [queued[0], helpers[0]] });
+  await settle();
+  const plain = [...strip.querySelectorAll('.helper-row')].map((row) => row.textContent);
+  assert.equal(plain.length, 2);
+  assert.match(plain[0], /Rebuild the truth table/, 'the running job comes first even without a fold');
+  assert.match(plain[1], /Queued task 1/);
+
+  // Jobs of the same kind keep the order they arrived in, whichever list they came from.
+  emit({
+    type: 'helpers.changed',
+    helpers: [
+      { id: 'hlp_new', botId: 'bot_a', chatId: chat, title: 'Queued task 9', task: 'Queued task 9', status: 'queued', createdAt: Date.now() },
+      { id: 'hlp_old', botId: 'bot_a', chatId: chat, title: 'Queued task 8', task: 'Queued task 8', status: 'queued', createdAt: Date.now() - 60000 },
+    ],
+  });
+  await settle();
+  const sameKind = [...strip.querySelectorAll('.helper-row')].map((row) => row.textContent);
+  assert.match(sameKind[0], /Queued task 8/, 'the job that arrived first comes first');
+  assert.match(sameKind[1], /Queued task 9/);
 
   // The open queue ends with the queue: when it shrinks to three jobs the fold button goes,
   // and the next busy chat starts folded again.
