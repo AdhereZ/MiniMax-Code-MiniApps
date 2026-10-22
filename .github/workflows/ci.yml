@@ -24,13 +24,13 @@ jobs:
       - run: npm ci
       - run: npm run check
 
-  desktop-pet:
-    name: desktop-pet (ubuntu-latest)
+  minimax-pet:
+    name: minimax-pet (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
       run:
-        working-directory: sources/myprototypewhat/codex-pet-spike
+        working-directory: sources/myprototypewhat/minimax-pet
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,7 +39,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: sources/myprototypewhat/codex-pet-spike/package-lock.json
+          cache-dependency-path: sources/myprototypewhat/minimax-pet/package-lock.json
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run test:smoke
