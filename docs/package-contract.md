@@ -2,9 +2,10 @@
 
 Verified against MiniMax Code 3.1.2.
 
-The `session.read` and `deviceAccess` extensions below require a Host build that implements them.
-Their minimum released client version has not been verified; accepting their declaration here
-does not establish runtime support on MiniMax Code 3.1.2.
+The `session.read` grant requires MiniMax Code 3.1.4 or later (observed on 3.1.4-preview).
+Observation and `deviceAccess` below additionally require a Host build that implements them;
+their minimum released client version has not been verified. Declaration checks do not prove
+runtime availability.
 
 A Mini App is a MiniMax Plugin whose `package.json` declares a Mini App payload. MiniMax Code
 enforces the manifest, payload, and path rules below when the package is installed. `npm run check`
@@ -121,9 +122,9 @@ No other keys are allowed inside `mcode`. Other top-level keys (`name`, `type`, 
   repository does not document their use.
 - `agentAccess` is optional: a unique string array containing `"session.run"`, `"session.read"`,
   or both. `session.run` lets the Mini App run its own Agent turns (MiniMax Code 3.1.2 or later).
-  `session.read` is a Host extension for listing, reading and observing the user's visible
-  conversations; its minimum released client version is unverified. Neither grant implies the
-  other. Absent or `[]` means no Agent access. See `docs/agent.md` before declaring it.
+  `session.read` reads visible conversations, including the chat the page is open in, and
+  requires 3.1.4 or later. Neither grant implies the other. Absent or `[]` means no Agent access.
+  Observation requires additional Host support; see `docs/agent.md` before declaring it.
 - `agentConcurrency` is optional: an integer from 1 to 32, default 4. It caps how many Agent turns
   of this Mini App run at once; it has no effect without `agentAccess`. Requires MiniMax Code 3.1.2
   or later.
@@ -133,7 +134,7 @@ No other keys are allowed inside `mcode`. Other top-level keys (`name`, `type`, 
   microphone use. Its minimum released client version is unverified; see `docs/client.md`.
 
 `npm run check` rejects unknown capabilities and duplicate grants. It reports
-`HOST_EXTENSION_UNVERIFIED` for `session.read` or microphone declarations so contributors explain
+`HOST_EXTENSION_UNVERIFIED` for microphone declarations so contributors explain
 the tested Host build and unverified release compatibility in the README and pull request. The
 check validates manifest shape, not whether the installed Host has or grants these capabilities.
 
@@ -187,6 +188,7 @@ the package cannot be installed there at all.
 | --- | --- | --- |
 | `agents` | `plugin.json` | 3.1.2 |
 | `agentAccess: ["session.run"]` | `miniapp/miniapp.json` | 3.1.2 |
+| `agentAccess` with `"session.read"` | `miniapp/miniapp.json` | 3.1.4 |
 | `agentConcurrency` | `miniapp/miniapp.json` | 3.1.2 |
 | `surface.window` | `miniapp/miniapp.json` | 3.1.2 |
 
@@ -194,8 +196,8 @@ When a package declares any of these, name a MiniMax Code version at or above th
 `## Tested environment` in its README, for example `- MiniMax Code 3.1.2 on macOS 15`.
 `npm run check` warns until it finds one there.
 
-The table is not a release guarantee for `session.read` or `deviceAccess`. Packages using these
-extensions must name the Host build they actually tested and state that the minimum released
+The table does not establish observation or `deviceAccess` availability. Packages using these
+extensions must name the Host build they actually tested and state that their minimum released
 version is unverified. Older clients may reject the entire manifest. Do not remove a required
 grant or replace read access with run access merely to make a package install.
 

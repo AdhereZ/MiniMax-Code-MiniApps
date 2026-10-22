@@ -49,6 +49,7 @@ export async function checkMiniApp(report, { packageDir, manifest }) {
   checkAgentConcurrency(report, manifest.agentConcurrency);
   checkDeviceAccess(report, manifest.deviceAccess);
   if (manifest.agentAccess !== undefined) resolved.features.push('agentAccess');
+  if (Array.isArray(manifest.agentAccess) && manifest.agentAccess.includes('session.read')) resolved.features.push('agentAccess.session.read');
   if (manifest.agentConcurrency !== undefined) resolved.features.push('agentConcurrency');
   if (isRecord(manifest.surface) && manifest.surface.window !== undefined) resolved.features.push('surface.window');
   return resolved;
@@ -224,7 +225,6 @@ function checkAgentAccess(report, value) {
     report.error('MINIAPP_AGENT_ACCESS_INVALID', `agentAccess must be a unique string array containing only ${[...AGENT_ACCESS_CAPABILITIES].map((c) => `"${c}"`).join(', ')}`, FILE);
     return;
   }
-  if (value.includes('session.read')) reportHostExtension(report, 'session.read');
 }
 
 function checkDeviceAccess(report, value) {

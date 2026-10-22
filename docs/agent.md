@@ -1,8 +1,8 @@
 # Mini App Agent API
 
 Agent-turn APIs verified against MiniMax Code 3.1.2. Earlier clients reject packages that declare
-`agentAccess`. The read-only extension below needs a supporting Host build; its minimum released
-client version is unverified.
+`agentAccess`. Read access requires 3.1.4 or later (observed on 3.1.4-preview). The observation
+extension below needs additional Host support; its minimum released client version is unverified.
 
 A Mini App can run Agent turns from its Node entry (`context.agent`) or its page
 (`window.mcode.miniapp.agent`). The Agent keeps its full capabilities: files, shell, Skills, and MCP,
@@ -21,6 +21,12 @@ at runtime; a page that only prepares text for the user to send should use
 
 - `agentAccess` in `miniapp/miniapp.json` is the only grant. Absent or `[]` means no access:
   `context.agent` is absent and page calls reject with `not_permitted`.
+- `"session.read"` (MiniMax Code 3.1.4 or later, observed on 3.1.4-preview) adds read access to
+  sessions: on the page, `agent.session()` with no argument returns the chat the Mini App is open in
+  (`sessionId`, `title`, `agent`, `status`, `workspaceDir`, `isDefaultWorkspace`, `createdAtMs`,
+  `updatedAtMs`, `model`, `lastAssistantText`) and rejects with `not_permitted` when it is not open
+  in a chat; `agent.session(sessionId)` reads one session and `agent.sessions()` lists the user's
+  sessions with their titles and folders. Read only what you need and say so in the README.
 - `agentConcurrency` (1–32, default 4) caps how many turns of this Mini App run at once. Each session
   runs one turn at a time. Further `run` / `answer` calls wait in order, up to four times
   `agentConcurrency`; beyond that they fail with `busy`.
@@ -34,14 +40,15 @@ at runtime; a page that only prepares text for the user to send should use
 turns, answer questions, decide approvals, or stop the user's work. `session.run` does not imply
 read access to user conversations. A package that needs both must declare both, once each.
 
-These methods are an extension used by the desktop pet. They require a supporting Host build,
-not merely a client whose version is at least 3.1.2. Check the page's `capabilities.has` and method
-availability before use (see `docs/client.md`). The minimum released version has not been verified.
+The `sessions` and `session` reads require 3.1.4 or later, as above. The observation methods used
+by the desktop pet additionally require a supporting Host build; their minimum released version
+has not been verified. Check the page's `capabilities.has` and method availability before use
+(see `docs/client.md`).
 
 | Page call | Read behavior |
 | --- | --- |
 | `sessions()` | Returns `{ sessions }` containing up to the 50 most recently updated visible root user conversations. It excludes Mini App-owned, scheduled and sub-Agent sessions. |
-| `session()` | Returns the conversation this page belongs to, or `undefined` when the page is not open in a conversation. This is not a promise to identify the currently focused main-window conversation. |
+| `session()` | Returns the conversation this page belongs to. The observed 3.1.4-preview build rejects with `not_permitted` outside a conversation; callers should also handle an absent result from other builds. This is not a promise to identify the currently focused main-window conversation. |
 | `session(sessionId)` | Returns a visible conversation's summary, current model when available, and latest assistant reply when available. It does not expose arbitrary Host files. |
 | `observe({ all: true, requestId }, { onEvent })` | Tails lifecycle events for visible user conversations. Use it together with `sessions()`; it is not a complete historical snapshot. |
 | `observe({ sessionId, requestId }, { onEvent })` | Tails progress events for one readable conversation. It does not replay earlier events or deliver actionable approval/question requests to the observer. |
@@ -62,8 +69,8 @@ only while permission is available. These are observation limits, separate from 
 
 Keep user conversation data transient unless the app explicitly documents persistence. Do not
 forward it to a network service or include it in diagnostics without the user's authorization.
-`npm run check` warns about this extension because static validation does not prove runtime or
-released-client compatibility.
+The version check for the read grant does not prove that the observation methods are available
+or that an installed Host has granted access.
 
 ## Sessions
 

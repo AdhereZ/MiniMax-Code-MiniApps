@@ -59,6 +59,7 @@ elsewhere without disclosing that behavior and obtaining authorization.
 `deviceAccess: ["microphone"]` separately declares microphone use. Record only after a user action,
 show recording state, and release audio capture on stop, cancel or page disposal. Host speech
 transcription may send audio to the Host's speech service; state this in the Mini App README and
-preserve text input when the feature or permission is unavailable. Neither extension has a
-verified minimum released client version; declaration validation is not a permission grant or
-a runtime compatibility guarantee.
+preserve text input when the feature or permission is unavailable. Read access requires 3.1.4
+or later (observed on 3.1.4-preview); the minimum released version for observation and microphone/
+transcription remains unverified. Declaration validation is not a permission grant or a runtime
+compatibility guarantee.

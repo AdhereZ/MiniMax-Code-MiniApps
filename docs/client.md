@@ -2,9 +2,9 @@
 
 Verified against MiniMax Code 3.1.2.
 
-The session-reading and speech extensions described below require a Host build that implements
-them; their minimum released client version is unverified. They are not part of the 3.1.2
-verification claim.
+Session reads require 3.1.4 or later (observed on 3.1.4-preview). Observation and speech additionally
+require a Host build that implements them; their minimum released client version is unverified.
+These capabilities are not part of the 3.1.2 verification claim.
 
 MiniMax Code injects `window.mcode.miniapp` into the Mini App's own page. Older clients, ordinary
 Browser tabs, and other browsers do not provide it, so check that a method exists before calling

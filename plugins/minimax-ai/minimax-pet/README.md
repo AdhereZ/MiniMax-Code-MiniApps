@@ -27,8 +27,8 @@ Earlier local prototypes use a different plugin ID. The Host gives `minimax-pet`
 
 ## Tested environment
 
-- MiniMax Code **3.1.2 or later** is the repository's baseline installation requirement for `surface.window` and Agent declarations. **This is not a claim that every 3.1.2 release provides the read/observe or speech APIs below.**
-- Task monitoring requires a Host build exposing `agent.sessions`, `agent.session`, `agent.observe`, `agent.cancel`, and the `session.read` grant. A minimum released version for these APIs has not been established for this plugin. Missing APIs are reported as unsupported.
+- MiniMax Code **3.1.4 or later** is the repository's minimum installation requirement for this package's `session.read` declaration (upstream reads were observed on 3.1.4-preview). **This is not released-client GUI acceptance of this plugin or a guarantee of the observation and speech APIs below.**
+- Task monitoring additionally requires a Host build exposing `agent.observe` and `agent.cancel`, alongside `agent.sessions` and `agent.session`. A minimum released version for complete task monitoring has not been established for this plugin. Missing APIs are reported as unsupported.
 - Voice input additionally requires `deviceAccess: ["microphone"]`, `speech.transcribe`, and microphone permission; otherwise it remains unavailable.
 - The preceding UI version was exercised on macOS in a MiniMax Code development build: three tabs, wide/narrow layouts, task reading, real session/ask activity, import/delete, draft confirmation, and desktop round trips. This open-source revision has Node/DOM tests and an isolated HTTP smoke test.
 - The new original atlas and icon are checked by actual PNG decoding, frame coverage and deterministic rebuild tests. The earlier native UI acceptance predates this artwork.

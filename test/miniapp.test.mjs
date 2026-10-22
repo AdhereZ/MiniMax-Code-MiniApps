@@ -149,12 +149,10 @@ test('miniapp: agentAccess keeps session.run and session.read separate', async (
   assert.deepEqual(denied.resolved.features, ['agentAccess']);
   for (const value of [['session.read'], ['session.run', 'session.read']]) {
     const read = await run((m) => { m.agentAccess = value; return m; });
-    assert.deepEqual(codes(read.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED']);
-    assert.equal(read.report.diagnostics[0].level, 'warning');
-    assert.match(read.report.diagnostics[0].message, /minimum released client version is unverified/u);
-    assert.deepEqual(read.resolved.features, ['agentAccess']);
+    assert.deepEqual(read.report.diagnostics, []);
+    assert.deepEqual(read.resolved.features, ['agentAccess', 'agentAccess.session.read']);
   }
-  for (const value of [['session.write'], ['session.run', 'session.run'], ['session.read', 'session.read'], 'session.run', [null], null, {}]) {
+  for (const value of [['session.write'], ['session.run', 'session.write'], ['session.run', 'session.run'], ['session.read', 'session.read'], 'session.run', [null], null, {}]) {
     const bad = await run((m) => { m.agentAccess = value; return m; });
     assert.deepEqual(codes(bad.report.diagnostics), ['MINIAPP_AGENT_ACCESS_INVALID'], JSON.stringify(value));
   }
@@ -180,7 +178,9 @@ test('miniapp: read-only observation and microphone do not imply Agent runs or a
     m.deviceAccess = ['microphone'];
     return m;
   });
-  assert.deepEqual(codes(read.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED', 'HOST_EXTENSION_UNVERIFIED']);
+  assert.deepEqual(codes(read.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED']);
+  assert.match(read.report.diagnostics[0].message, /microphone/u);
+  assert.deepEqual(read.resolved.features, ['agentAccess', 'agentAccess.session.read']);
   const unknown = await run((m) => { m.devices = ['microphone']; return m; });
   assert.deepEqual(codes(unknown.report.diagnostics), ['MINIAPP_UNKNOWN_FIELD']);
 });

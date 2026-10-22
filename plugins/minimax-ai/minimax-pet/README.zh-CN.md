@@ -14,7 +14,7 @@
 
 ## 环境与兼容
 
-透明窗口和 Agent 声明至少要求 MiniMax Code 3.1.2；这不代表所有 3.1.2 发行版都具备桌宠需要的会话读取、观察和语音接口。任务功能要求 Host 提供 `session.read`、`agent.sessions/session/observe/cancel`，其最低正式发行版本尚未确认。缺少接口时显示不支持；语音还需要 `speech.transcribe`、麦克风声明和权限。
+本包声明 `session.read`，按仓库契约至少要求 MiniMax Code **3.1.4**；上游读取接口的已观察环境为 3.1.4-preview，这不代表本插件已完成正式客户端 GUI 验收，也不保证观察和语音接口可用。完整任务监控还要求 Host 提供 `agent.observe/cancel`，以及 `agent.sessions/session`，其最低正式发行版本尚未确认。缺少接口时显示不支持；语音还需要 `speech.transcribe`、麦克风声明和权限。
 
 此前 UI 版本已在 macOS 开发版验收三页签、窄宽布局、真实任务与 ask、导入删除、草稿确认和桌面切换；当前开源修订运行 Node／DOM 测试与隔离 HTTP smoke。新原创图集和图标通过 PNG 解码、动画帧覆盖与确定性重建检查；此前原生 UI 验收早于本次素材替换。Windows GUI、正式客户端安装、真实录音／ASR 未在当前修订中验收。
 

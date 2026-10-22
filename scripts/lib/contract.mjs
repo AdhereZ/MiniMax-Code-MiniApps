@@ -7,6 +7,8 @@ export const HOST_VERSION = '3.1.2';
 export const FEATURE_MIN_HOST_VERSION = Object.freeze({
   agents: '3.1.2',
   agentAccess: '3.1.2',
+  // agentAccess "session.read": page agent.session() / agent.sessions(); observed on 3.1.4
+  'agentAccess.session.read': '3.1.4',
   agentConcurrency: '3.1.2',
   'surface.window': '3.1.2',
 });
