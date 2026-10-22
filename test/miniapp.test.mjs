@@ -140,17 +140,49 @@ test('miniapp: surface.window rejects unknown fields, non-booleans, min above si
   assert.deepEqual(equal.report.diagnostics, []);
 });
 
-test('miniapp: agentAccess allows only session.run and reports the feature', async () => {
+test('miniapp: agentAccess keeps session.run and session.read separate', async () => {
   const granted = await run((m) => { m.agentAccess = ['session.run']; return m; });
   assert.deepEqual(granted.report.diagnostics, []);
   assert.deepEqual(granted.resolved.features, ['agentAccess']);
   const denied = await run((m) => { m.agentAccess = []; return m; });
   assert.deepEqual(denied.report.diagnostics, []);
   assert.deepEqual(denied.resolved.features, ['agentAccess']);
-  for (const value of [['session.run', 'session.read'], 'session.run', [null]]) {
+  for (const value of [['session.read'], ['session.run', 'session.read']]) {
+    const read = await run((m) => { m.agentAccess = value; return m; });
+    assert.deepEqual(codes(read.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED']);
+    assert.equal(read.report.diagnostics[0].level, 'warning');
+    assert.match(read.report.diagnostics[0].message, /minimum released client version is unverified/u);
+    assert.deepEqual(read.resolved.features, ['agentAccess']);
+  }
+  for (const value of [['session.write'], ['session.run', 'session.run'], ['session.read', 'session.read'], 'session.run', [null], null, {}]) {
     const bad = await run((m) => { m.agentAccess = value; return m; });
     assert.deepEqual(codes(bad.report.diagnostics), ['MINIAPP_AGENT_ACCESS_INVALID'], JSON.stringify(value));
   }
+});
+
+test('miniapp: microphone is a separate Host extension and cannot declare other devices', async () => {
+  const enabled = await run((m) => { m.deviceAccess = ['microphone']; return m; });
+  assert.deepEqual(codes(enabled.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED']);
+  assert.equal(enabled.report.diagnostics[0].level, 'warning');
+  assert.match(enabled.report.diagnostics[0].message, /deviceAccess: microphone/u);
+  assert.deepEqual(enabled.resolved.features, []);
+  const empty = await run((m) => { m.deviceAccess = []; return m; });
+  assert.deepEqual(empty.report.diagnostics, []);
+  for (const value of [['camera'], ['microphone', 'camera'], ['microphone', 'microphone'], 'microphone', [null], null, {}]) {
+    const bad = await run((m) => { m.deviceAccess = value; return m; });
+    assert.deepEqual(codes(bad.report.diagnostics), ['MINIAPP_DEVICE_ACCESS_INVALID'], JSON.stringify(value));
+  }
+});
+
+test('miniapp: read-only observation and microphone do not imply Agent runs or accept unknown fields', async () => {
+  const read = await run((m) => {
+    m.agentAccess = ['session.read'];
+    m.deviceAccess = ['microphone'];
+    return m;
+  });
+  assert.deepEqual(codes(read.report.diagnostics), ['HOST_EXTENSION_UNVERIFIED', 'HOST_EXTENSION_UNVERIFIED']);
+  const unknown = await run((m) => { m.devices = ['microphone']; return m; });
+  assert.deepEqual(codes(unknown.report.diagnostics), ['MINIAPP_UNKNOWN_FIELD']);
 });
 
 test('miniapp: agentConcurrency is an integer from 1 to 32 and reports the feature', async () => {
