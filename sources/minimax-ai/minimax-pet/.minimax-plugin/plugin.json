@@ -8,7 +8,8 @@
   "icon": "icon.png",
   "category": "Other",
   "exampleQueries": [
-    "打开 MiniMax Pet，查看任务提醒"
+    "打开 MiniMax Pet，查看任务提醒",
+    "制作一只原创桌宠，生成可导入的图集"
   ],
   "apps": [],
   "mcpServers": [],

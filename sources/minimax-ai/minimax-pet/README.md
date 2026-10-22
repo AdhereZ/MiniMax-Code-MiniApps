@@ -44,6 +44,10 @@ Earlier local prototypes use a different plugin ID. The Host gives `minimax-pet`
 - **Microphone and network:** recording is user-initiated in the draft tool. Audio stays in memory and is passed to Host `speech.transcribe`; leaving the tool cancels capture/transcription. The Host transcription service may use its configured network services. The plugin has no hard-coded external runtime endpoint; its own HTTP requests use its assigned loopback origin.
 - **Processes and Agent turns:** the Host starts one Node process. The plugin spawns no additional runtime process, launches no shell command, offers no MCP server, and never calls `agent.run`.
 
+## Agent Skill
+
+The `minimax-pet` Skill opens the app and guides the current Agent through creating custom pet artwork. It includes exact v1/v2 dimensions, animation and look layouts, alpha and metadata requirements, and a self-contained Node PNG validation tool. Files stay in the user workspace until import is confirmed; this does not add automatic Agent runs to the MiniApp.
+
 ## Bundled artwork
 
 The default is an original MiniMax Pet character, with all nine animation states and sixteen look directions. The atlas and icon can be regenerated with Node.js from the source directory. See [ARTWORK.md](ARTWORK.md).

@@ -101,6 +101,25 @@ test('original v2 atlas contains sixteen distinct visible look directions', () =
   assert.equal(new Set(frames.map(digest)).size, 16);
 });
 
+test('original gaze frames follow the player pointer convention: up, then clockwise', () => {
+  const eyeHighlight = (direction) => {
+    const pixels = cellPixels(atlases[1], 9 + Math.floor(direction / 8), direction % 8);
+    let count = 0, x = 0, y = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (pixels[index] === 255 && pixels[index + 1] === 255 && pixels[index + 2] === 255 && pixels[index + 3] === 255) {
+        count += 1; x += (index / 4) % CELL.width; y += Math.floor(index / 4 / CELL.width);
+      }
+    }
+    assert.ok(count > 0, 'the original robot has visible eye highlights');
+    return { x: x / count, y: y / count };
+  };
+  const [up, right, down, left] = [0, 4, 8, 12].map(eyeHighlight);
+  assert.equal(up.x, down.x);
+  assert.equal(left.y, right.y);
+  assert.ok(up.y < right.y && down.y > right.y);
+  assert.ok(left.x < up.x && right.x > up.x);
+});
+
 test('bundled first-party PNG is reproducible and has matching v2 pet metadata', async () => {
   assert.deepEqual(createPetAtlas({ version: 1 }), v1);
   assert.deepEqual(createPetAtlas({ version: 2 }), v2);

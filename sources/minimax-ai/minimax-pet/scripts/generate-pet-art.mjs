@@ -106,8 +106,8 @@ function drawPet(sheet, row, frame) {
   const headY = 28 + dy + headDrop;
   const bodyY = 62 + dy;
   const lookAngle = row >= 9 ? ((row - 9) * 8 + frame) * Math.PI / 8 : null;
-  const gazeX = lookAngle === null ? (row === 1 ? 2 : row === 2 ? -2 : 0) : Math.round(Math.cos(lookAngle) * 3);
-  const gazeY = lookAngle === null ? 0 : Math.round(Math.sin(lookAngle) * 2);
+  const gazeX = lookAngle === null ? (row === 1 ? 2 : row === 2 ? -2 : 0) : Math.round(Math.sin(lookAngle) * 3);
+  const gazeY = lookAngle === null ? 0 : Math.round(-Math.cos(lookAngle) * 2);
 
   // A small coral antenna is the pet's identifying accent.
   line(48 + dx, headY - 6, 48 + dx, headY + 1, 3, INK);
