@@ -23,7 +23,7 @@ npm run check:package
 
 `package` stages an explicit runtime/documentation allowlist under `dist/package`. Synchronize that complete directory to `plugins/minimax-ai/minimax-pet` before `check:package`. The comparison covers every path and file byte, including images, code, metadata and licenses, and rejects links. Tests, the development lockfile, dependencies, tools, and local state are not staged.
 
-The root `npm run check` validates package contracts. The MiniMax Pet CI job also runs the source tests, HTTP smoke, staging and exact distribution comparison. Tests use synthetic data and temporary data directories; they do not need the user's real Host profile.
+The root `npm run check` validates package contracts through the repository's existing workflow. Run the source tests, HTTP smoke, staging and exact distribution comparison locally with the commands above; this package does not add or change repository CI jobs. Tests use synthetic data and temporary data directories; they do not need the user's real Host profile.
 
 ## Dependencies and artwork
 
