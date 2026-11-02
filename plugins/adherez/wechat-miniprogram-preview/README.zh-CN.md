@@ -53,6 +53,8 @@ Agent 按专属 Skill 执行 `preview_list`、`preview_open_project`，然后必
   的文件权限沙箱，仅预览可信工程。
 - **写文件**：只向 Host 提供的 `context.dataDir` 写预览记录、工程路径、Storage 和迁移元数据，
   把该目录位置视为不透明。运行时不修改业务工程。用户请求导出时由浏览器下载 JSON。
+  Shell 页面在自身 `localStorage` 中按 Host 窗口 id 保存最多 16 条租约身份（仅 ID，不含 Storage
+  数据），用于弹出/收回重载后接回本窗口租约。
 - **网络**：Node 无出站请求，只监听 Host 分配的 loopback 端口。预览允许业务工程指定的
   **任意 HTTPS 图片地址**，可能向这些图片主机发送普通网络元数据；没有固定域名白名单。
   `wx.request` 等网络 API 不支持，iframe 的 `connect-src` 为 `none`。没有遥测或上传服务。
@@ -73,6 +75,10 @@ Storage 按 canonical 工程目录隔离，每工程 1 MiB。同工程多个预�
 CAS 防覆盖；最多 8 个预览记录、4 个活动工程、4 个连接页面。超限不会自动关闭其他窗口。
 冲突、响应丢失、页面被占用时，通过 `preview_status` 和 `preview_recover` 处理；
 `takeover`、`discard_local`、`close` 必须先确认影响，不手改私有数据或反复 create_new。
+在 MiniMax Code webview 后端中，弹出为独立窗口或收回侧栏会重新加载页面。新页面凭 Host 稳定的
+`window.mcode.miniapp.window.id` 与页面 `localStorage` 中记录的本窗口租约匹配时，直接接回本窗口
+原租约，不再弹确认；预览从已保存 Storage 重新启动，未提交的页面内存仍会丢失。其他窗口持有的
+租约仍需显式 `takeover`。
 重启后用原 previewId 重新打开，持久 Storage 不等于页面内存备份。
 
 ## 能力边界

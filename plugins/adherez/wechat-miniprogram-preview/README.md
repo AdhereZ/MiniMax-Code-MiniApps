@@ -77,6 +77,8 @@ authorization dialog. An occupied preview is not automatically taken over.
   metadata under the Host-provided **`context.dataDir`**. This directory is treated as opaque.
   The runtime does not edit your project, read Host credentials, inspect chat history, or depend on
   Host database locations. User-requested Storage export downloads a JSON file through the browser.
+  The Shell page keeps up to 16 lease identities (IDs only, no Storage data) in its own
+  `localStorage`, keyed by the Host window id, to resume a lease after a pop-out/return reload.
 - **Network:** Node makes no outbound requests. Its HTTP/MCP/SSE server binds only the Host-assigned
   loopback address/port. The preview iframe allows **HTTPS image URLs authored by the project**
   (`img-src https:`), which can contact arbitrary project-chosen image hosts and disclose usual
@@ -107,6 +109,11 @@ pages. Resource limits return diagnostics rather than silently closing another p
 
 On conflicts, lost responses or occupied previews, use `preview_status` / `preview_logs` and the
 reported recovery actions. `takeover`, `discard_local` and `close` require explicit confirmation.
+Popping the Mini App out to its own window or returning it to the side panel can reload its page
+(MiniMax Code's webview backend). The reloaded page resumes the lease its own window held, without
+a confirmation, when the Host's stable `window.mcode.miniapp.window.id` and a page-local
+(`localStorage`) record of that lease match; the preview restarts from saved Storage, so
+uncommitted page memory is still lost. A lease held by any other window still requires `takeover`.
 Do not keep creating new previews or editing private state files to bypass ownership. Before
 updates, export valuable pending data; stop/start only this Mini App if the Host retains an old
 runtime. Reopen its original `previewId` after restart. Saved Storage is not a backup of page memory.

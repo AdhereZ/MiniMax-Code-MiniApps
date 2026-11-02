@@ -12,7 +12,7 @@ const error = (code, message = code, details) => response({ ok: false, code, mes
 const tick = async () => { for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve)); };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
-async function setup(t, { selected = 'pv_one', owner = false, intercept, autoQuiesce = true, game = false, deviceId = '390x844', gameOrientation = 'landscape', autoDispose = true, realRecovery = false } = {}) {
+async function setup(t, { selected = 'pv_one', owner = false, intercept, autoQuiesce = true, game = false, deviceId = '390x844', gameOrientation = 'landscape', autoDispose = true, realRecovery = false, hostWindowId, windowOwners } = {}) {
   const dom = new JSDOM(html, { url: 'http://preview.test/preview' + (selected ? '?previewId=' + selected : ''), runScripts: 'outside-only', virtualConsole: new VirtualConsole() });
   t.after(() => dom.window.close());
   const win = dom.window, get = (id) => win.document.getElementById(id), requests = [], messages = [], streams = [], confirms = [], exports = [], timers = [];
@@ -161,6 +161,8 @@ async function setup(t, { selected = 'pv_one', owner = false, intercept, autoQui
     const stream = streams.filter((s) => !s.closed && channels.get(/^\/api\/shells\/([^/]+)\/events$/.exec(s.url)?.[1])?.previewId === id).at(-1);
     stream?.events.get(name)?.({ data: JSON.stringify({ previewId: id, projectId: contexts.get(id)?.projectId, serverEpoch: 'epoch-one', ...data }) });
   }
+  if (hostWindowId !== undefined) win.mcode = { miniapp: { window: { id: hostWindowId } } };
+  if (windowOwners) win.localStorage.setItem('wx-preview-window-owners', JSON.stringify(windowOwners));
   win.eval(devices); win.eval(shell); await tick();
   return { win, get, requests, messages, streams, contexts, saved, operations, channels, registry, confirms, exports, timers, backend, send, emit,
     async expire(delay) { const timer = timers.findLast((entry) => entry.active && entry.delay === delay); assert.ok(timer, `expected active ${delay}ms timer`); timer.active = false; timer.fn(); await tick(); },
@@ -348,6 +350,51 @@ test('takeover only happens through a current chat command with confirmation; ex
   const result = await e.recover('takeover');
   assert.equal(result.channel.acks.at(-1).status, 'completed'); assert.equal(e.confirms.length, 1);
   assert.equal(e.requests.findLast((r) => r.url.endsWith('/frame')).body.action, 'takeover');
+});
+
+const previousOwner = { previewId: 'pv_one', projectId: 'aaaaaaaaaaaa', serverEpoch: 'epoch-one', buildId: 'build-one', clientId: 'other', instanceId: 'other-instance', leaseEpoch: 1 };
+const windowOwnersRecord = (e) => JSON.parse(e.win.localStorage.getItem('wx-preview-window-owners') || '{}');
+
+test('a window that rebuilt its page for pop-out or return resumes its own lease without asking', async (t) => {
+  const e = await setup(t, { owner: true, hostWindowId: 'surface-1', windowOwners: { 'surface-1': { at: 1, identity: previousOwner } } });
+  const frame = e.requests.find((r) => r.url.endsWith('/frame'));
+  assert.equal(frame?.body.action, 'takeover');
+  assert.equal(frame.body.previous, undefined); assert.equal(frame.body.dirty, false);
+  assert.equal(e.confirms.length, 0);
+  assert.notEqual(e.contexts.get('pv_one').lease.clientId, 'other');
+  assert.equal(e.get('simulator').hidden, false);
+  assert.doesNotMatch(e.get('empty').textContent, /另一窗口/);
+  await e.start();
+  assert.equal(e.get('refresh-preview').disabled, false);
+  // The resumed lease is recorded so the next pop-out/return can resume again.
+  assert.equal(windowOwnersRecord(e)['surface-1'].identity.clientId, e.contexts.get('pv_one').lease.clientId);
+});
+
+test('a lease from another window, a newer lease or a page without a Host window id still waits for explicit takeover', async (t) => {
+  for (const options of [
+    { hostWindowId: 'surface-2', windowOwners: { 'surface-1': { at: 1, identity: previousOwner } } },
+    { hostWindowId: 'surface-1', windowOwners: { 'surface-1': { at: 1, identity: { ...previousOwner, instanceId: 'older-instance' } } } },
+    { hostWindowId: 'surface-1', windowOwners: { 'surface-1': { at: 1, identity: { ...previousOwner, serverEpoch: 'epoch-old' } } } },
+    { windowOwners: { 'surface-1': { at: 1, identity: previousOwner } } },
+  ]) {
+    const e = await setup(t, { owner: true, ...options });
+    assert.equal(e.requests.some((r) => r.url.endsWith('/frame')), false);
+    assert.equal(e.contexts.get('pv_one').lease.clientId, 'other');
+    assert.match(e.get('empty').textContent, /另一窗口/);
+    assert.equal(e.get('refresh-preview').disabled, true);
+  }
+});
+
+test('an attached window records its committed lease and a foreign takeover is not mistaken for its own', async (t) => {
+  const e = await setup(t, { hostWindowId: 'surface-1' }); await e.start();
+  const own = e.contexts.get('pv_one').lease;
+  assert.equal(windowOwnersRecord(e)['surface-1'].identity.instanceId, own.instanceId);
+  const ctx = e.contexts.get('pv_one');
+  ctx.leaseEpoch++; ctx.lease = { clientId: 'intruder', instanceId: 'intruder-instance', buildId: 'build-one', leaseEpoch: ctx.leaseEpoch };
+  e.emit('frame-active', ctx.lease); await tick();
+  assert.match(e.get('empty').textContent, /接管/);
+  assert.equal(e.requests.filter((r) => r.url.endsWith('/frame')).length, 1);
+  assert.equal(windowOwnersRecord(e)['surface-1'].identity.instanceId, own.instanceId);
 });
 
 test('document-transfer failure never resumes an already-replaced lease and chat retry reloads only the committed identity', async (t) => {

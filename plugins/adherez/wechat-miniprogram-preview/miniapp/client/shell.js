@@ -86,6 +86,35 @@ async function api(endpoint, body, userAction) {
 }
 const endpoint = (name, id = previewId) => 'previews/' + encodeURIComponent(id) + '/' + name;
 const sameIdentity = (a, b) => !!a && !!b && ['previewId', 'projectId', 'serverEpoch', 'buildId', 'clientId', 'instanceId', 'leaseEpoch'].every((key) => a[key] === b[key]);
+// MiniMax Code keeps this id for one logical Mini App window while a webview pop-out or
+// return rebuilds the page. A lease committed by an earlier document of the same window is
+// ours to resume; a lease from any other window still requires an explicit takeover.
+const hostWindowId = (() => {
+  try { const id = window.mcode?.miniapp?.window?.id; return typeof id === 'string' && id.length > 0 && id.length <= 200 ? id : ''; }
+  catch { return ''; }
+})();
+const WINDOW_OWNERS_KEY = 'wx-preview-window-owners';
+const MAX_WINDOW_OWNERS = 16;
+function readWindowOwners() {
+  try { const value = JSON.parse(localStorage.getItem(WINDOW_OWNERS_KEY) || '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+  catch { return {}; }
+}
+function rememberWindowOwner(owner) {
+  if (!hostWindowId || !owner) return;
+  try {
+    const owners = readWindowOwners();
+    owners[hostWindowId] = { at: Date.now(), identity: Object.fromEntries(['previewId', 'projectId', 'serverEpoch', 'buildId', 'clientId', 'instanceId', 'leaseEpoch'].map((key) => [key, owner[key]])) };
+    const kept = Object.entries(owners).filter(([, entry]) => entry && Number.isFinite(entry.at)).sort((a, b) => b[1].at - a[1].at).slice(0, MAX_WINDOW_OWNERS);
+    localStorage.setItem(WINDOW_OWNERS_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    // Without page storage the shell keeps the explicit takeover path.
+  }
+}
+function windowOwnsLease(value = state) {
+  if (!hostWindowId || !value?.lease || value.recovering || value.reconnectTarget || identity || closed || bindingRetired) return false;
+  const previous = readWindowOwners()[hostWindowId]?.identity;
+  return sameIdentity(previous, { ...value.lease, previewId: value.previewId, projectId: value.projectId, serverEpoch: value.serverEpoch });
+}
 const dirty = () => JSON.stringify(storage) !== acknowledgedStorage;
 function selectedDevice() { return devices.get(state?.deviceId || devices.defaultId); }
 function requireReadyBuild(value = state) { if (value?.build?.status !== 'ok') throw new ApiError('当前构建不可用，请先在聊天中修复并重新构建；本地快照保持不变。', 'BUILD_NOT_AVAILABLE'); }
@@ -424,6 +453,7 @@ async function mountFrame(result, deviceId, layout = layoutForBuild(deviceId)) {
   ownershipLost = true;
   const snapshot = validStorage(result.storage.data);
   if (state) { state.lease = result.identity; state.leaseEpoch = result.identity.leaseEpoch; }
+  rememberWindowOwner(result.identity);
   const assertCurrent = () => {
     if (pendingDocument !== pending || closed || pendingClosed || bindingRetired || state?.serverEpoch !== result.identity.serverEpoch
       || state?.projectId !== result.identity.projectId || state?.leaseEpoch !== result.identity.leaseEpoch) throw new ApiError('文档加载期间预览归属已变化，旧文档没有重新挂载。', 'STALE_FRAME');
@@ -488,7 +518,12 @@ function startupFailure(message) {
 async function transitionFrame({ takeover = false, discard = false } = {}) {
   if (!state || state.build?.status !== 'ok' || closed) return;
   if (uncertainOperation || pendingDocument) throw new ApiError('请先确认上一次操作或重新加载已确认页面。', 'OUTCOME_UNKNOWN');
-  if (state.lease && !identity && !takeover) { showOtherOwner(); return; }
+  // The previous document of this same window was destroyed by a pop-out/return rebuild,
+  // so resuming its lease cannot evict a live page and needs no confirmation.
+  if (state.lease && !identity && !takeover) {
+    if (!windowOwnsLease()) { showOtherOwner(); return; }
+    takeover = true;
+  }
   const oldIdentity = identity;
   const deviceId = selectedDevice().id;
   const action = takeover ? 'takeover' : oldIdentity ? 'reload' : 'attach';
@@ -589,7 +624,7 @@ function applyState(next) {
   if (!route) route = next.route || '';
   runtimeStatus = identity ? runtimeStatus : next.preview || next.runtime || runtimeStatus;
   if (next.build?.status === 'error') { automaticBlocked = !!storageProblem; if (!identity) setEmpty('构建未通过', '修复诊断后会重新构建。'); }
-  if (!identity && next.lease) showOtherOwner();
+  if (!identity && next.lease && !windowOwnsLease()) showOtherOwner();
   renderDetails(); runCommand(next.command); maybeLoad();
 }
 function loseOwnership() {
@@ -658,7 +693,7 @@ function listen(events, id, epoch, generation, channel) {
     if (mutationPending || data.leaseEpoch <= (state?.leaseEpoch || 0)) return;
     state = { ...state, lease: data, leaseEpoch: data.leaseEpoch };
     if (identity && !sameIdentity(identity, data)) loseOwnership();
-    else if (!identity) showOtherOwner();
+    else if (!identity && !windowOwnsLease()) showOtherOwner();
   }));
   events.addEventListener('closed', receive(() => { if (mutationPending) pendingClosed = true; else markClosed(); }));
   events.addEventListener('storage-updated', receive((data) => { if (data.originPreviewId !== id && data.revision > ackRevision) notice('其他预览已更新此工程 Storage。当前运行内存保持不变，下一次写入可能需要处理冲突。'); }));
@@ -677,7 +712,7 @@ async function openCurrentPreview() {
     await registerRecovery();
     if (generation !== selectionGeneration || closed || bindingRetired) return;
     renderDetails();
-    if (state.lease) showOtherOwner();
+    if (state.lease && !windowOwnsLease()) showOtherOwner();
     else if (state.build?.status === 'ok') await transitionFrame();
   } catch (error) {
     if (error.code === 'PREVIEW_CONTEXT_NOT_FOUND') markClosed();
